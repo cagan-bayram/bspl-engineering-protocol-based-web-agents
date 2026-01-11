@@ -1,0 +1,177 @@
+{
+  "role": "Seller",
+  "protocol": "Purchase",
+  "keys": [
+    "ID"
+  ],
+  "messages": [
+    {
+      "name": "rfq",
+      "direction": "receive",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "out",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [],
+      "outs": [
+        "ID",
+        "item"
+      ],
+      "nils": []
+    },
+    {
+      "name": "quote",
+      "direction": "send",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "price",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "ID",
+        "item"
+      ],
+      "outs": [
+        "price"
+      ],
+      "nils": []
+    },
+    {
+      "name": "accept",
+      "direction": "receive",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "price",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "address",
+          "adornment": "out",
+          "key": false
+        },
+        {
+          "name": "resp",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "ID",
+        "item",
+        "price"
+      ],
+      "outs": [
+        "address",
+        "resp"
+      ],
+      "nils": []
+    },
+    {
+      "name": "reject",
+      "direction": "receive",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "price",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "outcome",
+          "adornment": "out",
+          "key": false
+        },
+        {
+          "name": "resp",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "ID",
+        "item",
+        "price"
+      ],
+      "outs": [
+        "outcome",
+        "resp"
+      ],
+      "nils": []
+    },
+    {
+      "name": "ship",
+      "direction": "send",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "address",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "shipped",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "address",
+        "ID",
+        "item"
+      ],
+      "outs": [
+        "shipped"
+      ],
+      "nils": []
+    }
+  ]
+}

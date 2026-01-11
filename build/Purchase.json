@@ -1,0 +1,20 @@
+{
+  "protocol": "Purchase",
+  "source": "protocols\\reference\\purchase.bspl",
+  "roles": [
+    "Buyer",
+    "Seller",
+    "Shipper"
+  ],
+  "messages": [
+    "rfq",
+    "quote",
+    "accept",
+    "reject",
+    "ship",
+    "deliver"
+  ],
+  "keys": [
+    "ID"
+  ]
+}

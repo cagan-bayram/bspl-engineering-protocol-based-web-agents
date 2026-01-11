@@ -1,0 +1,21 @@
+{
+  "protocol": "Logistics",
+  "source": "protocols\\reference\\logistics.bspl",
+  "roles": [
+    "Merchant",
+    "Wrapper",
+    "Labeler",
+    "Packer"
+  ],
+  "messages": [
+    "RequestLabel",
+    "RequestWrapping",
+    "Wrapped",
+    "Labeled",
+    "Packed"
+  ],
+  "keys": [
+    "orderID",
+    "itemID"
+  ]
+}

@@ -67,6 +67,17 @@ This repository is under active development.
 Features are introduced incrementally and committed feature-by-feature to reflect
 the design and implementation process of the system.
 
+## Structure of the Repository
+
+- `app/`: Core application code for protocol compilation and enactment
+- `frontend/`: Web frontend components
+- `templates/`: HTML templates for rendering web pages
+- `requirements.txt`: Python dependencies
+- `README.md`: This documentation file
+- `LICENSE`: License information
+- `build/`: JSON specifications generated from BSPL protocols
+- `protocols/`: BSPL protocol specification files
+
 ## License
 
 This project is licensed under the MIT License.

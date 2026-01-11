@@ -1,0 +1,108 @@
+{
+  "role": "Merchant",
+  "protocol": "Logistics",
+  "keys": [
+    "orderID",
+    "itemID"
+  ],
+  "messages": [
+    {
+      "name": "RequestLabel",
+      "direction": "send",
+      "parameters": [
+        {
+          "name": "orderID",
+          "adornment": "out",
+          "key": true
+        },
+        {
+          "name": "address",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [],
+      "outs": [
+        "orderID",
+        "address"
+      ],
+      "nils": []
+    },
+    {
+      "name": "RequestWrapping",
+      "direction": "send",
+      "parameters": [
+        {
+          "name": "orderID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "itemID",
+          "adornment": "out",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "orderID"
+      ],
+      "outs": [
+        "itemID",
+        "item"
+      ],
+      "nils": []
+    },
+    {
+      "name": "Packed",
+      "direction": "receive",
+      "parameters": [
+        {
+          "name": "orderID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "itemID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "wrapping",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "label",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "status",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "itemID",
+        "wrapping",
+        "label",
+        "item",
+        "orderID"
+      ],
+      "outs": [
+        "status"
+      ],
+      "nils": []
+    }
+  ]
+}

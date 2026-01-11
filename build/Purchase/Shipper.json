@@ -1,0 +1,79 @@
+{
+  "role": "Shipper",
+  "protocol": "Purchase",
+  "keys": [
+    "ID"
+  ],
+  "messages": [
+    {
+      "name": "ship",
+      "direction": "receive",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "address",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "shipped",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "address",
+        "ID",
+        "item"
+      ],
+      "outs": [
+        "shipped"
+      ],
+      "nils": []
+    },
+    {
+      "name": "deliver",
+      "direction": "send",
+      "parameters": [
+        {
+          "name": "ID",
+          "adornment": "in",
+          "key": true
+        },
+        {
+          "name": "item",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "address",
+          "adornment": "in",
+          "key": false
+        },
+        {
+          "name": "outcome",
+          "adornment": "out",
+          "key": false
+        }
+      ],
+      "ins": [
+        "address",
+        "ID",
+        "item"
+      ],
+      "outs": [
+        "outcome"
+      ],
+      "nils": []
+    }
+  ]
+}
