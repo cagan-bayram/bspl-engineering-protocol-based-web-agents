@@ -22,8 +22,8 @@
       ],
       "ins": [],
       "outs": [
-        "ID",
-        "item"
+        "item",
+        "ID"
       ],
       "nils": []
     },
@@ -48,8 +48,8 @@
         }
       ],
       "ins": [
-        "ID",
-        "item"
+        "item",
+        "ID"
       ],
       "outs": [
         "price"
@@ -87,13 +87,13 @@
         }
       ],
       "ins": [
-        "ID",
         "item",
-        "price"
+        "price",
+        "ID"
       ],
       "outs": [
-        "address",
-        "resp"
+        "resp",
+        "address"
       ],
       "nils": []
     },
@@ -128,13 +128,13 @@
         }
       ],
       "ins": [
-        "ID",
         "item",
-        "price"
+        "price",
+        "ID"
       ],
       "outs": [
-        "outcome",
-        "resp"
+        "resp",
+        "outcome"
       ],
       "nils": []
     },
@@ -164,9 +164,9 @@
         }
       ],
       "ins": [
-        "address",
+        "item",
         "ID",
-        "item"
+        "address"
       ],
       "outs": [
         "outcome"

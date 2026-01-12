@@ -52,8 +52,8 @@
         "orderID"
       ],
       "outs": [
-        "itemID",
-        "item"
+        "item",
+        "itemID"
       ],
       "nils": []
     },
@@ -93,11 +93,11 @@
         }
       ],
       "ins": [
+        "orderID",
         "itemID",
         "wrapping",
-        "label",
         "item",
-        "orderID"
+        "label"
       ],
       "outs": [
         "status"

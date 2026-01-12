@@ -91,6 +91,9 @@ def compile_protocol(bspl_file: Path, output_dir: Path) -> None:
     output_dir:
         Directory into which generated artefacts should be written.
     """
+    # Import bspl lazily so that type checkers don't complain when
+    # bspl isn't installed.  If bspl is not available at runtime, an
+    # ImportError will be raised here instead of at module import.
     try:
         import bspl  # type: ignore
     except ImportError as exc:
@@ -141,10 +144,35 @@ def compile_protocol(bspl_file: Path, output_dir: Path) -> None:
         # role‑specific details.
         protocol_obj = spec.export(name)
 
-        # Build a high‑level summary of protocol components for quick reference
+        # Build a high‑level summary of protocol components for quick reference. 
         # Extract role and message names directly from the protocol object.
         roles = list(protocol_obj.roles.keys())
         messages = list(protocol_obj.messages.keys())
+
+        # Build a mapping of how each key parameter is used across messages.
+        # BSPL keys identify a protocol instance.  Understanding which messages
+        # consume, produce, or ignore a key helps when grouping
+        # enactments by key value. Iterate over all messages in
+        # the protocol and record the adornment of every key parameter.  The
+        # result is a dictionary like ``{'orderID': {'ins': [...], 'outs': [...]}}
+        # where each list contains message names that reference the key under
+        # that adornment.  Nils are included for completeness even if rarely
+        # used for keys.
+        key_groups: dict[str, dict[str, List[str]]] = {}
+        for k in list(protocol_obj.keys):
+            key_groups[k] = {"ins": [], "outs": [], "nils": []}
+        # Iterate over all messages defined by the protocol (not role-specific)
+        for msg_name, msg in protocol_obj.messages.items():
+            ins_params = set(getattr(msg, "ins", []))
+            outs_params = set(getattr(msg, "outs", []))
+            nil_params = set(getattr(msg, "nils", []))
+            for k in key_groups.keys():
+                if k in ins_params:
+                    key_groups[k]["ins"].append(msg_name)
+                if k in outs_params:
+                    key_groups[k]["outs"].append(msg_name)
+                if k in nil_params:
+                    key_groups[k]["nils"].append(msg_name)
 
         protocol_data = {
             "protocol": name,
@@ -152,6 +180,7 @@ def compile_protocol(bspl_file: Path, output_dir: Path) -> None:
             "roles": roles,
             "messages": messages,
             "keys": list(protocol_obj.keys),
+            "key_groups": key_groups,
         }
 
         # Write the protocol summary as JSON

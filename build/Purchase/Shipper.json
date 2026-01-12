@@ -31,9 +31,9 @@
         }
       ],
       "ins": [
-        "address",
+        "item",
         "ID",
-        "item"
+        "address"
       ],
       "outs": [
         "shipped"
@@ -66,9 +66,9 @@
         }
       ],
       "ins": [
-        "address",
+        "item",
         "ID",
-        "item"
+        "address"
       ],
       "outs": [
         "outcome"

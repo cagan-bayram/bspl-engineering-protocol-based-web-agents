@@ -17,5 +17,29 @@
   "keys": [
     "orderID",
     "itemID"
-  ]
+  ],
+  "key_groups": {
+    "orderID": {
+      "ins": [
+        "RequestWrapping",
+        "Wrapped",
+        "Labeled",
+        "Packed"
+      ],
+      "outs": [
+        "RequestLabel"
+      ],
+      "nils": []
+    },
+    "itemID": {
+      "ins": [
+        "Wrapped",
+        "Packed"
+      ],
+      "outs": [
+        "RequestWrapping"
+      ],
+      "nils": []
+    }
+  }
 }

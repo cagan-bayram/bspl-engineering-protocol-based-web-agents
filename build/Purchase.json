@@ -16,5 +16,20 @@
   ],
   "keys": [
     "ID"
-  ]
+  ],
+  "key_groups": {
+    "ID": {
+      "ins": [
+        "quote",
+        "accept",
+        "reject",
+        "ship",
+        "deliver"
+      ],
+      "outs": [
+        "rfq"
+      ],
+      "nils": []
+    }
+  }
 }
