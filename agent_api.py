@@ -27,7 +27,7 @@ API_PORT = int(os.getenv("API_PORT", "8001"))  # FastAPI REST
 RECEIVER_PORT = int(os.getenv("RECEIVER_PORT", "9001"))  # aiohttp receiver
 MESSAGES_PATH = os.getenv("MESSAGES_PATH", "/messages")
 
-# Optional: default agent/role name for this process (so you don't pass role= every time)
+# Optional: default agent/role name for this process (so we don't pass role= every time)
 AGENT_NAME = os.getenv("AGENT_NAME", "").strip()
 
 BASE_URLS_RAW = os.getenv(
@@ -85,7 +85,7 @@ app = FastAPI(
 # In-memory state
 # -------------------------
 
-# One Adapter per (protocol, role) per process (KEEP THIS to preserve working behavior)
+# One Adapter per (protocol, role) per process
 adapters: Dict[Tuple[str, str], Adapter] = {}
 
 # Track that we've fully bootstrapped (receiver + update loop + init signal)
@@ -163,7 +163,7 @@ def export_module(protocol_name: str, spec):
     try:
         protocol_obj = spec.export(protocol_name)
         return protocol_obj.module
-    except Exception as e:
+    except BaseException as e:
         import traceback
         print("EXPORT ERROR:", e)
         print(traceback.format_exc())
@@ -482,11 +482,11 @@ async def start_enactment(
     eid = enactment_id.strip() if enactment_id else str(uuid.uuid4())
     enactments[eid] = {"protocol": protocol_name, "role": role, "bindings": dict(body.bindings or {})}
     # Prime enabled messages with the enactment bindings (e.g., ID)
-    try:
-        adapter = adapters[(protocol_name, role)]  # ensure_adapter already created it
-        adapter.compute_enabled(enactments[eid]["bindings"])
-    except Exception as e:
-        print("compute_enabled failed (ignored):", e)
+    # try:
+    #     adapter = adapters[(protocol_name, role)]  # ensure_adapter already created it
+    #     adapter.compute_enabled(enactments[eid]["bindings"])
+    # except Exception as e:
+    #     print("compute_enabled failed (ignored):", e)
 
     print(f"Started enactment {eid} for {protocol_name}/{role} bindings={enactments[eid]['bindings']}")
 
@@ -504,10 +504,10 @@ async def get_enabled_actions(protocol_name: str, enactment_id: str, role: Optio
     adapter = await ensure_adapter(protocol_name, role)
 
     # Ensure enabled messages reflect current bindings
-    try:
-        adapter.compute_enabled(bindings)
-    except Exception as e:
-        print("compute_enabled failed (ignored):", e)
+    # try:
+    #     adapter.compute_enabled(bindings)
+    # except Exception as e:
+    #     print("compute_enabled failed (ignored):", e)
 
     actions = _enabled_actions(adapter, bindings=bindings)
 
@@ -535,7 +535,10 @@ async def send_message(
     bindings = record.get("bindings", {}) or {}
 
     adapter = await ensure_adapter(protocol_name, role)
-    proto, _spec = load_protocol(protocol_name)
+    # proto, _spec = load_protocol(protocol_name)
+
+    system = adapter.systems["default"]
+    proto = system["protocol"]
 
     if message_name not in proto.messages:
         raise HTTPException(status_code=404, detail=f"Message '{message_name}' not found in protocol")
@@ -560,10 +563,11 @@ async def send_message(
             system="default",
         )
         await adapter.send(message)
-    except Exception as e:
+    except BaseException as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=400, detail=f"adapter.send() failed: {e}")
+        detail = f"adapter.send() failed. Possible dependency error (check logs). Error: {e}"
+        raise HTTPException(status_code=400, detail=detail)
 
     return {"status": "sent", "message": {"name": message_name, "payload": body.payload}}
 
