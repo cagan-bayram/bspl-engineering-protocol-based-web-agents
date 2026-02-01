@@ -1,0 +1,23 @@
+# These instructions are for Purchase scenario as an exmaple.
+
+1. Open dashboard.html in your web browser via Live Server extension.
+
+2. Connect:
+    - In "Agent API URL", enter: http://127.0.0.1:800x (where x is your agent's port number, e.g., 1 for Buyer, 2 for Seller, 3 for Shipper).
+    - Click "Connect" button.
+3. Start an enactment:
+    - Select "Purchase" protocol.
+    - Select your role (e.g., Buyer).
+    - Enter an enactment ID (e.g., test-1).
+    - Click "Start".
+
+4. Interact:
+    - Click the new button that appears under 'Enactments'.
+    - Look at the "Enabled Actions" panel. Should see 'rfq' for Buyer role.
+    - Fill inputs: ID = 100, item = Laptop.
+    - Click "Send rfq".
+
+5. Observe:
+    - Do this for other roles (Seller, Shipper) in separate browser tabs or windows.
+    - Follow the enactment flow by sending and receiving messages as per the protocol.
+

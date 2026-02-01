@@ -4,17 +4,24 @@ import asyncio
 import os
 import sys
 import uuid
+import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+from urllib.parse import urlparse
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import bspl
 from bspl.adapter.core import Adapter
 from bspl.adapter.http_adapter import HTTPEmitter, HTTPReceiver
-from bspl.adapter.event import InitEvent  # IMPORTANT: to bootstrap initiators
-
+from bspl.adapter.event import InitEvent
+from bspl.adapter.message import Message
 
 # -------------------------
 # Config (ENV-driven)
@@ -23,502 +30,376 @@ from bspl.adapter.event import InitEvent  # IMPORTANT: to bootstrap initiators
 PROTOCOL_DIR = Path(os.getenv("PROTOCOL_DIR", "protocols/reference"))
 GENERATED_DIR = Path(os.getenv("BSPL_GENERATED_DIR", ".bspl_generated")).resolve()
 
-API_PORT = int(os.getenv("API_PORT", "8001"))  # FastAPI REST
-RECEIVER_PORT = int(os.getenv("RECEIVER_PORT", "9001"))  # aiohttp receiver
+API_PORT = int(os.getenv("API_PORT", "8001"))
+RECEIVER_PORT = int(os.getenv("RECEIVER_PORT", "9001"))
 MESSAGES_PATH = os.getenv("MESSAGES_PATH", "/messages")
+AGENT_NAME = os.getenv("AGENT_NAME", "GenericAgent").strip()
+PUBLIC_HOST = os.getenv("PUBLIC_HOST", "127.0.0.1") 
 
-# Optional: default agent/role name for this process (so we don't pass role= every time)
-AGENT_NAME = os.getenv("AGENT_NAME", "").strip()
+DATA_FILE = Path(os.getenv("BSPL_DATA_FILE", f".agent_state_{AGENT_NAME}.json"))
 
-BASE_URLS_RAW = os.getenv(
-    "BASE_URLS",
-    # IMPORTANT: these should point to RECEIVER ports, not API ports.
-    "Buyer=http://127.0.0.1:9001,Seller=http://127.0.0.1:9002",
-)
+BASE_URLS_RAW = os.getenv("BASE_URLS", "")
 
-
-def normalize_protocol_name(protocol_name: str) -> str:
-    protocol_name = (protocol_name or "").strip()
-    if not protocol_name:
-        return protocol_name
-    return protocol_name[0].upper() + protocol_name[1:]
-
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(f"agent_api.{AGENT_NAME}")
 
 def parse_base_urls(raw: str) -> Dict[str, str]:
     raw = (raw or "").strip()
-    if not raw:
-        return {}
-    out: Dict[str, str] = {}
+    if not raw: return {}
+    out = {}
     for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" not in part:
-            raise ValueError(f"Invalid BASE_URLS entry (missing '='): {part}")
-        k, v = part.split("=", 1)
-        out[k.strip()] = v.strip().rstrip("/")
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip().rstrip("/")
     return out
-
 
 BASE_URLS = parse_base_urls(BASE_URLS_RAW)
 
-print(f"Using PROTOCOL_DIR: {PROTOCOL_DIR}")
-print(f"Using GENERATED_DIR: {GENERATED_DIR}")
-print(f"Using API_PORT: {API_PORT}")
-print(f"Using RECEIVER_PORT: {RECEIVER_PORT}")
-print(f"Using MESSAGES_PATH: {MESSAGES_PATH}")
-print(f"Using BASE_URLS: {BASE_URLS}")
-print(f"Using AGENT_NAME: {AGENT_NAME or '(not set)'}")
-
-
 # -------------------------
-# FastAPI app
+# Custom Dynamic Emitter
 # -------------------------
 
-app = FastAPI(
-    title="BSPL Agent API",
-    description="Serve BSPL specifications and enact protocols over HTTP",
-)
+class DynamicHTTPEmitter(HTTPEmitter):
+    async def send(self, message) -> None:
+        dest = message.dest
+        
+        dest_agent = None
+        if isinstance(dest, tuple):
+            dest_agent = self._endpoint_to_agent.get(dest)
+        elif isinstance(dest, str):
+            dest_agent = dest
 
+        if dest_agent and dest_agent in self.base_urls:
+            await super().send(message)
+            return
+
+        if isinstance(dest, tuple):
+            host, port = dest
+            url = f"http://{host}:{port}{self.path}"
+            payload = self.encode(message)
+            data = json.loads(payload)
+            try:
+                resp = await self.client.post(url, json=data)
+                self.stats["bytes"] += len(payload)
+                self.stats["packets"] += 1
+                resp.raise_for_status()
+            except Exception as exc:
+                logger.error(f"Dynamic send failed to {url}: {exc}")
+                raise
+        else:
+            raise RuntimeError(f"No base URL configured for destination agent '{dest}'")
 
 # -------------------------
-# In-memory state
+# State Management
 # -------------------------
 
-# One Adapter per (protocol, role) per process
 adapters: Dict[Tuple[str, str], Adapter] = {}
-
-# Track that we've fully bootstrapped (receiver + update loop + init signal)
 adapter_started: Dict[Tuple[str, str], bool] = {}
-
-# enactment_id -> {"protocol":..., "role":..., "bindings": {...}}
-# bindings are optional key/value constraints (e.g., {"ID": "1"})
-enactments: Dict[str, Dict[str, Any]] = {}
-
 _adapter_init_lock = asyncio.Lock()
 
+enactments: Dict[str, Dict[str, Any]] = {}
+
+class StateManager:
+    @staticmethod
+    def save():
+        data = {
+            "enactments": enactments,
+            "history": []
+        }
+        
+        for adapter in adapters.values():
+            for msg in adapter.history.messages():
+                if not hasattr(msg, 'schema') or not hasattr(msg.schema, 'protocol'):
+                    continue
+
+                data["history"].append({
+                    "protocol": msg.schema.protocol.name,
+                    "message": msg.schema.name,
+                    "payload": msg.payload,
+                    "meta": msg.meta,
+                    "system": msg.system,
+                    "sender": msg.schema.sender.name if msg.schema.sender else None
+                })
+        
+        try:
+            with open(DATA_FILE, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+            logger.info(f"State saved to {DATA_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    @staticmethod
+    async def load():
+        if not DATA_FILE.exists():
+            return
+
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+            
+            enactments.update(data.get("enactments", {}))
+            
+            needed_adapters = set()
+            for rec in enactments.values():
+                needed_adapters.add((rec['protocol'], rec['role']))
+            
+            history_items = data.get("history", [])
+            for item in history_items:
+                needed_adapters.add((normalize_protocol_name(item['protocol']), AGENT_NAME))
+
+            for prot, rol in needed_adapters:
+                await ensure_adapter(prot, rol)
+
+            for item in history_items:
+                p_name = item['protocol']
+                m_name = item['message']
+                
+                try:
+                    _, spec = load_protocol(p_name)
+                    proto = spec.protocols[normalize_protocol_name(p_name)]
+                    if m_name not in proto.messages: continue
+                    schema = proto.messages[m_name]
+                    
+                    msg = Message(
+                        schema=schema,
+                        payload=item['payload'],
+                        meta=item.get('meta', {}),
+                        system=item.get('system', 'default')
+                    )
+                    
+                    for (ap, ar), adapter in adapters.items():
+                        if ap == normalize_protocol_name(p_name):
+                            # Allow adding duplicate messages to history during load to restore state fully
+                            context = adapter.history.context(msg)
+                            match = context.find(schema)
+                            if not match:
+                                adapter.history.add(msg)
+                except Exception as ex:
+                    logger.warning(f"Skipping history item {m_name}: {ex}")
+                            
+            logger.info(f"State loaded from {DATA_FILE}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
 
 # -------------------------
-# Models
+# FastAPI App
 # -------------------------
 
-class StartEnactmentResponse(BaseModel):
-    protocol: str
-    role: str
-    enactment_id: str
-    bindings: Dict[str, Any] = {}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await StateManager.load()
+    yield
+    StateManager.save()
 
+app = FastAPI(title=f"Slik Agent: {AGENT_NAME}", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],  
+    allow_headers=["*"],  
+)
+
+app.mount("/static", StaticFiles(directory="."), name="static")
+
+@app.get("/dashboard.html")
+async def read_dashboard():
+    return FileResponse('dashboard.html')
+
+# -------------------------
+# Models & Helpers
+# -------------------------
 
 class StartEnactmentBody(BaseModel):
-    # Optional: keep a “focus” for this enactment (usually keys like ID / orderID)
     bindings: Dict[str, Any] = {}
-
+    peers: Dict[str, str] = {} 
 
 class SendBody(BaseModel):
     payload: Dict[str, Any]
 
+def safe_list(x):
+    try: return list(x)
+    except: return []
 
-# -------------------------
-# Helpers
-# -------------------------
-
-def safe_list(x: Any) -> List[Any]:
-    if x is None:
-        return []
-    try:
-        return list(x)
-    except Exception:
-        return []
-
-
-def ensure_generated_importable() -> None:
-    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    if str(GENERATED_DIR) not in sys.path:
-        sys.path.insert(0, str(GENERATED_DIR))
-
+def normalize_protocol_name(n: str) -> str:
+    return (n[0].upper() + n[1:]) if n else n
 
 def load_protocol(protocol_name: str):
     protocol_name = normalize_protocol_name(protocol_name)
     path = PROTOCOL_DIR / f"{protocol_name}.bspl"
     if not path.exists():
-        raise HTTPException(
-            status_code=404, detail=f"Protocol {protocol_name} not found at {path}"
-        )
+        raise HTTPException(404, f"Protocol {protocol_name} not found")
     spec = bspl.load_file(str(path))
-    if protocol_name not in spec.protocols:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Protocol name '{protocol_name}' not found inside file. Available: {list(spec.protocols.keys())}",
-        )
     return spec.protocols[protocol_name], spec
 
-
 def export_module(protocol_name: str, spec):
-    """
-    spec.export() builds an in-memory python module and registers it.
-    It does NOT write a file.
-    """
-    ensure_generated_importable()
-    protocol_name = normalize_protocol_name(protocol_name)
-    try:
-        protocol_obj = spec.export(protocol_name)
-        return protocol_obj.module
-    except BaseException as e:
-        import traceback
-        print("EXPORT ERROR:", e)
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
-
-
-async def _start_adapter_runtime(adapter: Adapter, key: Tuple[str, str], receiver: HTTPReceiver) -> None:
-    """
-    Bring the adapter to a 'running' state similar to Adapter.start(),
-    but without taking over the whole process (FastAPI owns the loop).
-    """
-    if adapter_started.get(key):
-        return
-
-    # Ensure the event queue exists (Adapter.__init__ creates it, but be safe)
-    if not hasattr(adapter, "events") or adapter.events is None:
-        from asyncio.queues import Queue
-        adapter.events = Queue()
-
-    # Start update loop (processes ReceptionEvent / EmissionEvent into enabled_messages, etc.)
-    adapter.running = True
-    asyncio.create_task(adapter.update_loop())
-
-    # Start receiver HTTP server
-    asyncio.create_task(receiver.task(adapter))
-
-    # Bootstrap initiators through the normal event mechanism
-    await adapter.signal(InitEvent())
-
-    adapter_started[key] = True
-
-    print(f"Adapter runtime started for {key}")
-    print(f"HTTPReceiver listening on http://{receiver.host}:{receiver.port}{receiver.path}")
-
-
-def _resolve_role(role: Optional[str]) -> str:
-    r = (role or "").strip()
-    if r:
-        return r
-    if AGENT_NAME:
-        return AGENT_NAME
-    raise HTTPException(status_code=400, detail="Missing role. Provide ?role=... or set AGENT_NAME env var.")
-
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    if str(GENERATED_DIR) not in sys.path: sys.path.insert(0, str(GENERATED_DIR))
+    return spec.export(normalize_protocol_name(protocol_name)).module
 
 async def ensure_adapter(protocol_name: str, role_name: str) -> Adapter:
     protocol_name = normalize_protocol_name(protocol_name)
-    role_name = role_name.strip()
-
     key = (protocol_name, role_name)
-    if key in adapters:
-        return adapters[key]
+    
+    if key in adapters: return adapters[key]
 
     async with _adapter_init_lock:
-        if key in adapters:
-            return adapters[key]
+        if key in adapters: return adapters[key]
 
         proto, spec = load_protocol(protocol_name)
-
-        if role_name not in proto.roles:
-            raise HTTPException(status_code=404, detail=f"Role {role_name} not found")
-
         mod = export_module(protocol_name, spec)
 
-        # Receiver port derived from BASE_URLS if provided
-        receiver_port = RECEIVER_PORT
-        if role_name in BASE_URLS:
-            from urllib.parse import urlparse
-            parsed = urlparse(BASE_URLS[role_name])
-            if parsed.port:
-                receiver_port = parsed.port
+        emitter = DynamicHTTPEmitter(base_urls=BASE_URLS, path=MESSAGES_PATH)
+        receiver = HTTPReceiver(host="0.0.0.0", port=RECEIVER_PORT, path=MESSAGES_PATH)
 
-        emitter = HTTPEmitter(base_urls=BASE_URLS, path=MESSAGES_PATH)
-        receiver = HTTPReceiver(host="0.0.0.0", port=receiver_port, path=MESSAGES_PATH)
-
-        # Adapter.send() indexes system["roles"] by Role objects -> agent name
-        roles_map: Dict[Any, str] = {}
-
-        # Map Role objects from the parsed protocol (these are often the ones schemas reference)
+        roles_map = {}
+        for r in proto.roles.values(): roles_map[r] = r.name
         for r in proto.roles.values():
-            roles_map[r] = r.name
+            if hasattr(mod, r.name): roles_map[getattr(mod, r.name)] = r.name
 
-        # ALSO map Role objects from the exported module (these might be different instances)
-        for r in proto.roles.values():
-            if hasattr(mod, r.name):
-                roles_map[getattr(mod, r.name)] = r.name
-
-        systems = {
-            "default": {
-                "protocol": proto,
-                "roles": roles_map,
-            }
-        }
-
-        # Agents mapping for routing: agent name -> list of (host, port)
-        agents: Dict[str, List[Tuple[str, int]]] = {}
+        agents = {}
         for r in proto.roles.values():
             if r.name in BASE_URLS:
-                from urllib.parse import urlparse
                 parsed = urlparse(BASE_URLS[r.name])
-                agents[r.name] = [(parsed.hostname or "127.0.0.1", parsed.port or RECEIVER_PORT)]
+                agents[r.name] = [(parsed.hostname or "127.0.0.1", parsed.port or 80)]
             else:
                 agents[r.name] = [("127.0.0.1", RECEIVER_PORT)]
 
         adapter = Adapter(
             name=role_name,
-            systems=systems,
+            systems={"default": {"protocol": proto, "roles": roles_map}},
             agents=agents,
             emitter=emitter,
             receiver=receiver,
         )
         adapters[key] = adapter
 
-        # Start receiver + update loop + init
-        try:
-            await _start_adapter_runtime(adapter, key, receiver)
-            print(f"Adapter initialised for protocol '{protocol_name}' role '{role_name}'")
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Failed to start adapter runtime: {e}")
+        if not adapter_started.get(key):
+            if not hasattr(adapter, "events") or adapter.events is None:
+                from asyncio.queues import Queue
+                adapter.events = Queue()
+            
+            adapter.running = True
+            asyncio.create_task(adapter.update_loop())
+            asyncio.create_task(receiver.task(adapter))
+            await adapter.signal(InitEvent())
+            adapter_started[key] = True
 
         return adapter
 
-
-def require_enactment(protocol_name: str, enactment_id: str, role: str) -> Dict[str, Any]:
-    protocol_name = normalize_protocol_name(protocol_name)
-    role = role.strip()
-
-    if enactment_id not in enactments:
-        raise HTTPException(status_code=404, detail="Enactment not found")
-
-    record = enactments[enactment_id]
-    if record["protocol"] != protocol_name or record["role"] != role:
-        raise HTTPException(status_code=400, detail="Enactment does not match protocol/role")
-
-    return record
-
-
-def _matches_bindings(payload: Dict[str, Any], bindings: Dict[str, Any]) -> bool:
-    """
-    Used to “focus” enabled messages on a particular enactment by key values.
-    This is best-effort: if enabled messages don't have payloads yet, we won't filter.
-    """
-    if not bindings:
-        return True
-    if not isinstance(payload, dict):
-        return True
-    for k, v in bindings.items():
-        if k in payload and payload.get(k) != v:
-            return False
-    return True
-
-
-def _enabled_actions(adapter: Adapter, bindings: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Convert adapter.enabled_messages into a JSON list for the UI.
-    Tries to filter by bindings when possible.
-    """
-    actions: List[Dict[str, Any]] = []
-
-    # enabled_messages.messages() yields enabled “partial messages”
-    enabled = list(adapter.enabled_messages.messages())
-
-    for m in enabled:
-        schema = getattr(m, "schema", None) or m
-        schema_name = getattr(schema, "name", None)
-
-        # Try to extract any currently known payload/bindings if present
-        payload = getattr(m, "payload", None) if hasattr(m, "payload") else {}
-        if isinstance(payload, dict) and not _matches_bindings(payload, bindings):
-            continue
-
-        actions.append(
-            {
-                "message": schema_name,
-                "outs": safe_list(getattr(schema, "outs", [])),
-                "ins": safe_list(getattr(schema, "ins", [])),
-                # sendability hint for UI
-                "known": payload if isinstance(payload, dict) else {},
-            }
-        )
-
-    return actions
-
-
 # -------------------------
-# REST endpoints: health/state
+# Endpoints
 # -------------------------
 
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {"ok": True}
-
-
-@app.get("/state")
-async def state(protocol: str, role: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Minimal “agent state” endpoint:
-    - enabled messages
-    - protocol/role info
-    - enactments in this process for that protocol/role
-    """
-    protocol = normalize_protocol_name(protocol)
-    role = _resolve_role(role)
-
-    adapter = await ensure_adapter(protocol, role)
-
-    related_eids = [
-        eid for eid, rec in enactments.items()
-        if rec["protocol"] == protocol and rec["role"] == role
-    ]
-
+@app.get("/vcard")
+def get_vcard():
+    protocols = []
+    if PROTOCOL_DIR.exists():
+        protocols = [p.stem for p in PROTOCOL_DIR.glob("*.bspl")]
     return {
-        "protocol": protocol,
-        "role": role,
-        "enactments": {eid: enactments[eid].get("bindings", {}) for eid in related_eids},
-        "enabled": _enabled_actions(adapter, bindings={}),  # all enabled (UI can filter by enactment later)
+        "agent": AGENT_NAME,
+        "endpoint": f"http://{PUBLIC_HOST}:{RECEIVER_PORT}{MESSAGES_PATH}",
+        "dashboard_api": f"http://{PUBLIC_HOST}:{API_PORT}",
+        "supported_protocols": protocols
     }
 
-
-# -------------------------
-# REST endpoints: protocols
-# -------------------------
-
-@app.get("/protocols", response_model=List[str])
-def list_protocols() -> List[str]:
-    if not PROTOCOL_DIR.exists():
-        return []
+@app.get("/protocols")
+def list_protocols():
+    if not PROTOCOL_DIR.exists(): return []
     return [p.stem for p in PROTOCOL_DIR.glob("*.bspl")]
 
-
 @app.get("/protocols/{protocol_name}")
-def get_protocol(protocol_name: str) -> Dict[str, Any]:
-    protocol_name = normalize_protocol_name(protocol_name)
-    proto, _spec = load_protocol(protocol_name)
-
-    summary = {
-        "protocol": protocol_name,
+def get_protocol_details(protocol_name: str):
+    proto, _ = load_protocol(protocol_name)
+    return {
+        "protocol": proto.name,
         "roles": list(proto.roles.keys()),
         "messages": list(proto.messages.keys()),
-        "keys": list(proto.keys),
-        "keys_usage": {k: {"ins": [], "outs": [], "nils": []} for k in proto.keys},
+        "parameters": list(proto.keys)
     }
 
-    for m_name, m in proto.messages.items():
-        for k in proto.keys:
-            if k in getattr(m, "ins", []):
-                summary["keys_usage"][k]["ins"].append(m_name)
-            if k in getattr(m, "outs", []):
-                summary["keys_usage"][k]["outs"].append(m_name)
-            if k in getattr(m, "nils", []):
-                summary["keys_usage"][k]["nils"].append(m_name)
-
-    return summary
-
-
-@app.get("/protocols/{protocol_name}/roles/{role_name}")
-def get_role_spec(protocol_name: str, role_name: str) -> Dict[str, Any]:
-    protocol_name = normalize_protocol_name(protocol_name)
-    proto, _spec = load_protocol(protocol_name)
-
-    if role_name not in proto.roles:
-        raise HTTPException(status_code=404, detail=f"Role {role_name} not found")
-
-    messages = []
-    for m_name, m in proto.messages.items():
-        if m.sender and m.sender.name == role_name:
-            direction = "send"
-        elif m.recipients and any(r.name == role_name for r in safe_list(m.recipients)):
-            direction = "receive"
-        else:
-            continue
-
-        messages.append(
-            {
-                "name": m_name,
-                "direction": direction,
-                "ins": safe_list(getattr(m, "ins", [])),
-                "outs": safe_list(getattr(m, "outs", [])),
-                "nils": safe_list(getattr(m, "nils", [])),
-                "parameters": [
-                    {
-                        "name": p_name,
-                        "adornment": m.public_parameters[p_name].adornment,
-                        "key": bool(m.public_parameters[p_name].key),
-                    }
-                    for p_name in m.public_parameters
-                ],
-            }
-        )
-
-    return {
-        "role": role_name,
-        "protocol": protocol_name,
-        "keys": list(proto.keys),
-        "messages": messages,
-    }
-
-
-# -------------------------
-# REST endpoints: enactments/actions/send
-# -------------------------
-
-@app.post("/protocols/{protocol_name}/enactments", response_model=StartEnactmentResponse)
+@app.post("/protocols/{protocol_name}/enactments")
 async def start_enactment(
     protocol_name: str,
     body: StartEnactmentBody,
-    role: Optional[str] = Query(None, description="Role name for this agent instance (optional if AGENT_NAME set)"),
-    enactment_id: Optional[str] = Query(None, description="Optional enactment id to share across agents"),
-) -> StartEnactmentResponse:
+    background_tasks: BackgroundTasks,
+    role: Optional[str] = Query(None),
+    enactment_id: Optional[str] = Query(None),
+):
     protocol_name = normalize_protocol_name(protocol_name)
-    role = _resolve_role(role)
+    if not role and AGENT_NAME: role = AGENT_NAME
+    if not role: raise HTTPException(400, "Role required")
 
     await ensure_adapter(protocol_name, role)
 
     eid = enactment_id.strip() if enactment_id else str(uuid.uuid4())
-    enactments[eid] = {"protocol": protocol_name, "role": role, "bindings": dict(body.bindings or {})}
-    # Prime enabled messages with the enactment bindings (e.g., ID)
-    # try:
-    #     adapter = adapters[(protocol_name, role)]  # ensure_adapter already created it
-    #     adapter.compute_enabled(enactments[eid]["bindings"])
-    # except Exception as e:
-    #     print("compute_enabled failed (ignored):", e)
-
-    print(f"Started enactment {eid} for {protocol_name}/{role} bindings={enactments[eid]['bindings']}")
-
-    return StartEnactmentResponse(protocol=protocol_name, role=role, enactment_id=eid, bindings=enactments[eid]["bindings"])
-
+    
+    enactments[eid] = {
+        "protocol": protocol_name, 
+        "role": role, 
+        "bindings": dict(body.bindings or {}),
+        "peers": dict(body.peers or {})
+    }
+    
+    logger.info(f"Enactment {eid} started. Peers: {enactments[eid]['peers']}")
+    background_tasks.add_task(StateManager.save)
+    return {"protocol": protocol_name, "role": role, "enactment_id": eid, "bindings": enactments[eid]["bindings"]}
 
 @app.get("/protocols/{protocol_name}/enactments/{enactment_id}/actions")
-async def get_enabled_actions(protocol_name: str, enactment_id: str, role: Optional[str] = None) -> Dict[str, Any]:
+async def get_actions(protocol_name: str, enactment_id: str, role: Optional[str] = None):
     protocol_name = normalize_protocol_name(protocol_name)
-    role = _resolve_role(role)
-
-    record = require_enactment(protocol_name, enactment_id, role)
-    bindings = record.get("bindings", {}) or {}
-
+    if not role: role = enactments.get(enactment_id, {}).get("role", AGENT_NAME)
+    
+    if enactment_id not in enactments: raise HTTPException(404, "Enactment not found")
+    
     adapter = await ensure_adapter(protocol_name, role)
+    record = enactments[enactment_id]
+    bindings = record["bindings"]
+    
+    updated = False
+    for m in list(adapter.enabled_messages.messages()):
+        payload = getattr(m, "payload", {}) or {}
+        if not payload: continue
+        
+        meta = getattr(m, "meta", {}) or {}
+        is_mine = (meta.get("enactment") == enactment_id)
+        if not is_mine and bindings:
+            if all(k in payload and payload[k] == v for k, v in bindings.items()):
+                is_mine = True
+        
+        if is_mine:
+            for k, v in payload.items():
+                if k not in bindings or bindings[k] != v:
+                    bindings[k] = v
+                    updated = True
+    
+    if updated: 
+        StateManager.save()
 
-    # Ensure enabled messages reflect current bindings
-    # try:
-    #     adapter.compute_enabled(bindings)
-    # except Exception as e:
-    #     print("compute_enabled failed (ignored):", e)
-
-    actions = _enabled_actions(adapter, bindings=bindings)
+    actions = []
+    for m in adapter.enabled_messages.messages():
+        schema = getattr(m, "schema", m)
+        payload = getattr(m, "payload", {})
+        meta = getattr(m, "meta", {})
+        
+        if meta.get("enactment") and meta.get("enactment") != enactment_id:
+            continue
+            
+        actions.append({
+            "message": schema.name,
+            "ins": safe_list(getattr(schema, "ins", [])),
+            "outs": safe_list(getattr(schema, "outs", [])),
+            "known": payload
+        })
 
     return {
-        "protocol": protocol_name,
-        "role": role,
         "enactment_id": enactment_id,
         "bindings": bindings,
-        "actions": actions,
+        "peers": record.get("peers", {}),
+        "actions": actions
     }
-
 
 @app.post("/protocols/{protocol_name}/enactments/{enactment_id}/send/{message_name}")
 async def send_message(
@@ -526,56 +407,95 @@ async def send_message(
     enactment_id: str,
     message_name: str,
     body: SendBody,
+    background_tasks: BackgroundTasks,
     role: Optional[str] = None,
-) -> Dict[str, Any]:
+):
     protocol_name = normalize_protocol_name(protocol_name)
-    role = _resolve_role(role)
+    if not role: role = enactments.get(enactment_id, {}).get("role", AGENT_NAME)
 
-    record = require_enactment(protocol_name, enactment_id, role)
-    bindings = record.get("bindings", {}) or {}
+    record = enactments[enactment_id]
+    bindings = record["bindings"]
+    peers = record.get("peers", {})
 
     adapter = await ensure_adapter(protocol_name, role)
-    # proto, _spec = load_protocol(protocol_name)
+    proto = adapter.systems["default"]["protocol"]
+    if message_name not in proto.messages: raise HTTPException(404, "Message not found")
+    
+    schema = proto.messages[message_name]
+    final_payload = {**bindings, **body.payload}
 
-    system = adapter.systems["default"]
-    proto = system["protocol"]
-
-    if message_name not in proto.messages:
-        raise HTTPException(status_code=404, detail=f"Message '{message_name}' not found in protocol")
-
-    message_schema = proto.messages[message_name]
-
-    # Optional: enforce that user payload doesn't contradict enactment bindings
-    for k, v in bindings.items():
-        if k in body.payload and body.payload[k] != v:
-            raise HTTPException(status_code=400, detail=f"Payload contradicts enactment binding {k}={v}")
-
-    from bspl.adapter.message import Message
-
-    try:
-        message = Message(
-            schema=message_schema,
-            payload=body.payload,
-            meta={"enactment": enactment_id},
-            acknowledged=False,
-            dest=None,
+    to_send = []
+    recipients = safe_list(schema.recipients)
+    
+    if not recipients:
+        msg = Message(
+            schema, 
+            final_payload, 
+            meta={"enactment": enactment_id}, 
             adapter=adapter,
-            system="default",
+            system="default" 
         )
-        await adapter.send(message)
-    except BaseException as e:
-        import traceback
-        traceback.print_exc()
-        detail = f"adapter.send() failed. Possible dependency error (check logs). Error: {e}"
-        raise HTTPException(status_code=400, detail=detail)
+        to_send.append(msg)
+    else:
+        for recip_role in recipients:
+            dest_url = None
+            role_name = getattr(recip_role, 'name', str(recip_role))
+            
+            if role_name in peers:
+                try:
+                    p = urlparse(peers[role_name])
+                    if p.hostname and p.port:
+                        dest_url = (p.hostname, p.port)
+                        logger.info(f"Routing {role_name} to {dest_url} (Dynamic)")
+                except:
+                    logger.warning(f"Invalid peer URL for {role_name}: {peers[role_name]}")
+            
+            msg = Message(
+                schema=schema, 
+                payload=final_payload, 
+                meta={"enactment": enactment_id}, 
+                dest=dest_url,
+                adapter=adapter,
+                system="default" 
+            )
+            to_send.append(msg)
 
-    return {"status": "sent", "message": {"name": message_name, "payload": body.payload}}
+    # --- IMPROVED RETRY LOGIC ---
+    try:
+        new_messages = []
+        retry_messages = []
 
+        for m in to_send:
+            # Check existence loosely (by schema and key parameters) rather than strict equality
+            # This handles cases where metadata (like timestamps) differs between memory and fresh object
+            context = adapter.history.context(m)
+            match = context.find(m.schema)
+            
+            if match:
+                # It exists in history -> FORCE RETRY
+                retry_messages.append(m)
+            else:
+                # It is new -> Send via adapter (which adds to history)
+                new_messages.append(m)
 
-# -------------------------
-# Main
-# -------------------------
+        if new_messages:
+            await adapter.send(*new_messages)
+            record["bindings"].update(final_payload)
+            background_tasks.add_task(StateManager.save)
+
+        if retry_messages:
+            logger.info(f"Retrying transmission for {len(retry_messages)} messages.")
+            for m in retry_messages:
+                # Manually emit to bypass duplicate checks
+                await adapter.emitter.send(m)
+
+        return {"status": "sent", "payload": final_payload}
+
+    except Exception as e:
+        logger.error(f"Send failed: {e}")
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Send failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=API_PORT, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT, reload=False)

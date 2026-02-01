@@ -1,0 +1,41 @@
+source .venv/Scripts/activate
+
+pip install -r requirements.txt
+
+# Terminal 1: Run the API
+export PROTOCOL_DIR="protocols/reference"
+export BASE_URLS="Buyer=http://127.0.0.1:9001,Seller=http://127.0.0.1:9002,Shipper=http://127.0.0.1:9003"
+python agent_api.py
+
+# Terminal 2: Test with curl commands
+
+# Health check
+curl -X 'GET' 'http://127.0.0.1:8001/health' -H 'accept: application/json'
+
+# List protocols
+curl -X 'GET' 'http://127.0.0.1:8001/protocols' -H 'accept: application/json'
+
+# Start an enactment (example for Buyer role in Purchase protocol)
+curl -X 'POST' \
+  'http://127.0.0.1:8001/protocols/Purchase/enactments?role=Buyer&enactment_id=test-1' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+
+# Get enabled actions for the enactment
+curl -X 'GET' \
+  'http://127.0.0.1:8001/protocols/Purchase/enactments/test-1/actions?role=Buyer' \
+  -H 'accept: application/json'
+
+# Send a message (example for Buyer sending rfq)
+curl -X 'POST' \
+  'http://127.0.0.1:8001/protocols/Purchase/enactments/test-1/send/rfq?role=Buyer' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "payload": {
+    "ID": "100",
+    "item": "Laptop"
+  }
+}'
+
