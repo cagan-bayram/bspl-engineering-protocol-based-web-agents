@@ -418,6 +418,14 @@ async def send_message(
     peers = record.get("peers", {})
 
     adapter = await ensure_adapter(protocol_name, role)
+
+    if hasattr(adapter, "history"):
+        for m in adapter.history.messages():
+            meta = getattr(m, "meta", {}) or {}
+            if meta.get("enactment") == enactment_id:
+                payload = getattr(m, "payload", {}) or {}
+                bindings.update(payload)
+
     proto = adapter.systems["default"]["protocol"]
     if message_name not in proto.messages: raise HTTPException(404, "Message not found")
     
@@ -438,9 +446,8 @@ async def send_message(
         to_send.append(msg)
     else:
         for recip_role in recipients:
-            dest_url = None
             role_name = getattr(recip_role, 'name', str(recip_role))
-            
+            dest_url = role_name
             if role_name in peers:
                 try:
                     p = urlparse(peers[role_name])
