@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Slik Agent Dashboard</title>
+    <style>
+        :root { --primary: #2563eb; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: var(--bg); color: var(--text); }
+        .card { background: var(--card); padding: 24px; margin-bottom: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
+        h1, h2, h3, h4 { margin-top: 0; }
+        .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+        .col { display: flex; flex-direction: column; gap: 8px; }
+        input, select, button { padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }
+        button { background: var(--primary); color: white; border: none; cursor: pointer; font-weight: 500; transition: 0.2s; }
+        button:hover { background: #1d4ed8; }
+        button.secondary { background: #64748b; }
+        .tag { background: #e0f2fe; color: #0369a1; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: 600; }
+        .message-box { border: 1px solid #e2e8f0; padding: 16px; margin-top: 12px; border-radius: 8px; background: #fdfdfd; }
+        .param-row { margin-bottom: 8px; display: flex; align-items: center; }
+        .param-row label { width: 140px; font-weight: 500; color: #64748b; }
+        .param-row input { flex: 1; }
+        pre { background: #1e293b; color: #f8fafc; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 0.9em; }
+        .status { padding: 8px 12px; border-radius: 6px; font-size: 0.9em; font-weight: 500; }
+        .status.ok { background: #dcfce7; color: #15803d; }
+        .status.err { background: #fee2e2; color: #991b1b; }
+        .peer-config { margin-top: 10px; padding: 10px; background: #f1f5f9; border-radius: 6px; display: none; }
+        .peer-row { display: flex; gap: 10px; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h2>🤖 Slik Agent Dashboard</h2>
+            <div id="connectionStatus" class="status">Not Connected</div>
+        </div>
+        <div class="row">
+            <input type="text" id="agentUrl" value="http://127.0.0.1:8001" style="flex:1" placeholder="Agent API URL">
+            <button onclick="connect()">Connect</button>
+        </div>
+        
+        <div id="vcardDisplay" style="margin-top: 15px; display:none; padding-top:15px; border-top:1px solid #eee;">
+            <div class="row">
+                <strong>Identity:</strong> <span id="vcName"></span>
+                <strong>Endpoint:</strong> <a id="vcEndpoint" href="#" target="_blank"></a>
+            </div>
+            <div style="margin-top:5px;">
+                <strong>Protocols:</strong> <span id="vcProtocols"></span>
+            </div>
+        </div>
+    </div>
+
+    <div id="app" style="display:none;">
+        <div class="card">
+            <h3>🚀 Start Enactment (Lobby)</h3>
+            <div class="col">
+                <div class="row">
+                    <select id="protocolSelect" onchange="loadRoleOptions()" style="flex:1"></select>
+                    <input type="text" id="roleInput" placeholder="My Role (e.g. Buyer)" style="flex:1">
+                    <input type="text" id="newEnactmentId" placeholder="Custom ID (Optional)" style="flex:1">
+                </div>
+                
+                <button type="button" class="secondary" onclick="togglePeerConfig()" style="width: auto; align-self: flex-start;">⚙️ Configure Peers (Lobby)</button>
+                
+                <div id="peerConfigPanel" class="peer-config">
+                    <small>Specify URLs for other roles in this enactment (Dynamic Binding)</small>
+                    <div id="peerInputs"></div>
+                </div>
+
+                <button type="button" onclick="startEnactment()">Start Protocol</button>
+            </div>
+        </div>
+
+        <div class="row" style="align-items: flex-start;">
+            <div class="card" style="flex: 1; min-height: 400px;">
+                <h3>📂 Enactments</h3>
+                <div id="enactmentList" style="display:flex; flex-direction:column; gap:8px;"></div>
+            </div>
+
+            <div class="card" style="flex: 2; min-height: 400px;">
+                <h3 id="currentEnactmentTitle">Select an enactment...</h3>
+                <div id="enactmentView" style="display:none;">
+                    
+                    <div class="row" style="margin-bottom:10px;">
+                        <small><strong>Peers:</strong> <span id="enactmentPeers"></span></small>
+                    </div>
+
+                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
+                        <div>
+                            <h4>🧠 Knowledge Base</h4>
+                            <pre id="knowledgeDisplay">{}</pre>
+                        </div>
+                        <div>
+                            <h4>⚡ Enabled Messages</h4>
+                            <div id="actionsList">Waiting for state...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let BASE_URL = "";
+        let currentEnactment = null;
+        let pollInterval = null;
+        let protocolCache = {};
+
+        async function connect() {
+            BASE_URL = document.getElementById('agentUrl').value.replace(/\/$/, "");
+            try {
+                const vcRes = await fetch(`${BASE_URL}/vcard`);
+                const vc = await vcRes.json();
+                
+                document.getElementById('vcName').innerText = vc.agent;
+                document.getElementById('vcEndpoint').innerText = vc.endpoint;
+                document.getElementById('vcEndpoint').href = vc.endpoint;
+                document.getElementById('vcProtocols').innerText = vc.supported_protocols.join(", ");
+                document.getElementById('vcardDisplay').style.display = 'block';
+
+                const pRes = await fetch(`${BASE_URL}/protocols`);
+                const protocols = await pRes.json();
+                const select = document.getElementById('protocolSelect');
+                select.innerHTML = protocols.map(p => `<option value="${p}">${p}</option>`).join('');
+                
+                if (protocols.length > 0) loadRoleOptions();
+
+                document.getElementById('app').style.display = 'block';
+                const status = document.getElementById('connectionStatus');
+                status.innerText = "Connected";
+                status.className = "status ok";
+            } catch (e) {
+                const status = document.getElementById('connectionStatus');
+                status.innerText = "Connection Failed";
+                status.className = "status err";
+                console.error(e);
+            }
+        }
+
+        async function loadRoleOptions() {
+            const proto = document.getElementById('protocolSelect').value;
+            if (!proto) return;
+            
+            const res = await fetch(`${BASE_URL}/protocols/${proto}`);
+            const data = await res.json();
+            protocolCache[proto] = data;
+
+            const container = document.getElementById('peerInputs');
+            container.innerHTML = "";
+            data.roles.forEach(r => {
+                container.innerHTML += `
+                    <div class="peer-row">
+                        <label style="width:100px;">${r}:</label>
+                        <input type="text" class="peer-url-input" data-role="${r}" placeholder="http://ip:port">
+                    </div>
+                `;
+            });
+        }
+
+        function togglePeerConfig() {
+            const el = document.getElementById('peerConfigPanel');
+            el.style.display = el.style.display === 'none' ? 'block' : 'none';
+        }
+
+        async function startEnactment() {
+            const protocol = document.getElementById('protocolSelect').value;
+            const role = document.getElementById('roleInput').value;
+            const eid = document.getElementById('newEnactmentId').value;
+            
+            const peers = {};
+            document.querySelectorAll('.peer-url-input').forEach(input => {
+                if (input.value.trim()) {
+                    peers[input.getAttribute('data-role')] = input.value.trim();
+                }
+            });
+
+            const body = { peers: peers, bindings: {} };
+            let url = `${BASE_URL}/protocols/${protocol}/enactments?role=${role}`;
+            if (eid) url += `&enactment_id=${eid}`;
+
+            try {
+                const res = await fetch(url, { 
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}, 
+                    body: JSON.stringify(body) 
+                });
+                const data = await res.json();
+                renderEnactmentList(protocol, role, data.enactment_id);
+                selectEnactment(data.enactment_id, protocol, role);
+            } catch (e) {
+                alert("Error: " + e);
+            }
+        }
+
+        function renderEnactmentList(protocol, role, id) {
+            const list = document.getElementById('enactmentList');
+            const btn = document.createElement('button');
+            btn.className = "secondary";
+            btn.style.textAlign = "left";
+            btn.innerHTML = `<strong>${protocol}</strong> <small>(${role})</small><br><span style="font-size:0.8em; opacity:0.8">${id.substring(0,8)}...</span>`;
+            btn.onclick = () => selectEnactment(id, protocol, role);
+            list.prepend(btn);
+        }
+
+        function selectEnactment(id, protocol, role) {
+            currentEnactment = { id, protocol, role };
+            document.getElementById('currentEnactmentTitle').innerText = `${protocol} - ${role}`;
+            document.getElementById('enactmentView').style.display = 'block';
+            
+            if (pollInterval) clearInterval(pollInterval);
+            fetchActions();
+            pollInterval = setInterval(fetchActions, 1000);
+        }
+
+        async function fetchActions() {
+            if (!currentEnactment) return;
+            const { protocol, id, role } = currentEnactment;
+            
+            try {
+                const res = await fetch(`${BASE_URL}/protocols/${protocol}/enactments/${id}/actions?role=${role}`);
+                const data = await res.json();
+                
+                document.getElementById('knowledgeDisplay').innerText = JSON.stringify(data.bindings, null, 2);
+                document.getElementById('enactmentPeers').innerText = Object.keys(data.peers).length ? JSON.stringify(data.peers) : "(Default/Static)";
+
+                const container = document.getElementById('actionsList');
+                
+                if (data.actions.length === 0) {
+                    container.innerHTML = '<div style="color:#888; font-style:italic">No actions available. Waiting...</div>';
+                    return;
+                }
+
+                data.actions.forEach(action => {
+                    let box = document.getElementById(`msg-box-${action.message}`);
+                    if (!box) {
+                        box = document.createElement('div');
+                        box.id = `msg-box-${action.message}`;
+                        box.className = 'message-box';
+                        box.innerHTML = `
+                            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                                <strong>✉️ ${action.message}</strong>
+                                <span class="tag">OUT: ${action.outs.join(', ')}</span>
+                            </div>
+                            <div id="inputs-${action.message}"></div>
+                            <button style="width:100%; margin-top:8px;" onclick="send('${action.message}')">Send</button>
+                        `;
+                        container.appendChild(box);
+                    }
+                    
+                    const inputContainer = box.querySelector(`#inputs-${action.message}`);
+                    
+                    action.outs.forEach(param => {
+                        const existingInput = document.getElementById(`input-${action.message}-${param}`);
+                        const knownVal = data.bindings[param] || "";
+                        
+                        if (!existingInput) {
+                            const row = document.createElement('div');
+                            row.className = "param-row";
+                            row.innerHTML = `<label>${param}:</label><input type="text" id="input-${action.message}-${param}" data-param="${param}" value="${knownVal}">`;
+                            inputContainer.appendChild(row);
+                        } else {
+                            if (document.activeElement !== existingInput && knownVal && existingInput.value !== knownVal) {
+                                existingInput.value = knownVal;
+                                existingInput.style.backgroundColor = "#e0f2fe"; 
+                            }
+                            if (knownVal) {
+                                existingInput.setAttribute("readonly", true);
+                            }
+                        }
+                    });
+                });
+
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function send(messageName) {
+            const { protocol, id, role } = currentEnactment;
+            const container = document.getElementById(`msg-box-${messageName}`);
+            const payload = {};
+            
+            container.querySelectorAll('input').forEach(inp => {
+                if (inp.value) payload[inp.getAttribute('data-param')] = inp.value;
+            });
+
+            const knowledge = JSON.parse(document.getElementById('knowledgeDisplay').innerText);
+            const fullPayload = { ...knowledge, ...payload };
+
+            try {
+                const res = await fetch(`${BASE_URL}/protocols/${protocol}/enactments/${id}/send/${messageName}?role=${role}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ payload: fullPayload })
+                });
+                if (res.ok) {
+                    alert("Status: sent"); // RESTORED ALERT
+                    fetchActions();
+                } else {
+                    const err = await res.json();
+                    alert("Error: " + err.detail);
+                }
+            } catch (e) {
+                alert("Network Error: " + e);
+            }
+        }
+    </script>
+</body>
+</html>
