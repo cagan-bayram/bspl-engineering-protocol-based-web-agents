@@ -239,7 +239,18 @@ async def get_actions(enactment_id: str, role: Optional[str] = None):
                     if any(payload[k] == bindings[k] for k in shared_keys): is_mine = True
             
             if is_mine:
+                # Deduce authorized parameters for this historical message
+                msg_schema = getattr(m, "schema", None)
+                valid_params = set()
+                if msg_schema:
+                    for p in safe_list(getattr(msg_schema, 'ins', [])) + safe_list(getattr(msg_schema, 'outs', [])):
+                        param_obj = p.param if hasattr(p, 'param') else p
+                        valid_params.add(str(getattr(param_obj, 'name', param_obj)).strip())
+
                 for k, v in payload.items():
+                    # Reject any information not explicitly governed by the protocol schema
+                    if valid_params and k not in valid_params:
+                        continue
                     if k not in bindings or bindings[k] != v:
                         bindings[k] = v
                         updated = True
@@ -322,13 +333,23 @@ async def send_message(enactment_id: str, message_name: str, body: dict, backgro
             req_payload[ref_name] = enactment_id
 
     final_payload = {**bindings, **req_payload}
+
+    # --- PRIVACY ENFORCEMENT FILTER ---
+    # Deduce the exact parameters permitted by the BSPL schema
+    valid_schema_params = set()
+    for p in safe_list(getattr(schema, 'ins', [])) + safe_list(getattr(schema, 'outs', [])):
+        param_obj = p.param if hasattr(p, 'param') else p
+        valid_schema_params.add(str(getattr(param_obj, 'name', param_obj)).strip())
+
+    # Isolate the payload to only transmit authorized knowledge
+    filtered_payload = {k: v for k, v in final_payload.items() if k in valid_schema_params}
     to_send = []
     recipients = safe_list(schema.recipients)
     
     # 2. Universal Deterministic Routing Matrix
     # 2. Universal Deterministic Routing Matrix (Pure Environment Variable Parsing)
     if not recipients:
-        to_send.append(Message(schema, final_payload, meta={"enactment": enactment_id}, adapter=adapter, system="default"))
+        to_send.append(Message(schema, filtered_payload, meta={"enactment": enactment_id}, adapter=adapter, system="default"))
     else:
         for recip_role in recipients:
             r_name = str(getattr(recip_role, 'name', recip_role)).strip()
@@ -348,7 +369,7 @@ async def send_message(enactment_id: str, message_name: str, body: dict, backgro
                 # If strictly not found in environment topology, fallback to self (Receiver Port)
                 dest_url = ("127.0.0.1", RECEIVER_PORT)
                 
-            to_send.append(Message(schema, final_payload, meta={"enactment": enactment_id}, dest=dest_url, adapter=adapter, system="default"))
+            to_send.append(Message(schema, filtered_payload, meta={"enactment": enactment_id}, dest=dest_url, adapter=adapter, system="default"))
 
     try:
         new_messages, retry_messages = [], []
