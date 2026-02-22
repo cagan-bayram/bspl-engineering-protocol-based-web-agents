@@ -2,308 +2,249 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Slik Agent Dashboard</title>
+    <title>Sliq Agent Dashboard</title>
     <style>
-        :root { --primary: #2563eb; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; }
+        :root { --primary: #2563eb; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; --success: #10b981; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: var(--bg); color: var(--text); }
         .card { background: var(--card); padding: 24px; margin-bottom: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
-        h1, h2, h3, h4 { margin-top: 0; }
-        .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+        h1, h3, h4 { margin-top: 0; }
+        .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
         .col { display: flex; flex-direction: column; gap: 8px; }
-        input, select, button { padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }
-        button { background: var(--primary); color: white; border: none; cursor: pointer; font-weight: 500; transition: 0.2s; }
-        button:hover { background: #1d4ed8; }
-        button.secondary { background: #64748b; }
-        .tag { background: #e0f2fe; color: #0369a1; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: 600; }
-        .message-box { border: 1px solid #e2e8f0; padding: 16px; margin-top: 12px; border-radius: 8px; background: #fdfdfd; }
-        .param-row { margin-bottom: 8px; display: flex; align-items: center; }
-        .param-row label { width: 140px; font-weight: 500; color: #64748b; }
-        .param-row input { flex: 1; }
-        pre { background: #1e293b; color: #f8fafc; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 0.9em; }
-        .status { padding: 8px 12px; border-radius: 6px; font-size: 0.9em; font-weight: 500; }
-        .status.ok { background: #dcfce7; color: #15803d; }
-        .status.err { background: #fee2e2; color: #991b1b; }
-        .peer-config { margin-top: 10px; padding: 10px; background: #f1f5f9; border-radius: 6px; display: none; }
-        .peer-row { display: flex; gap: 10px; margin-bottom: 5px; }
+        input, select, button { padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; width: 100%; box-sizing: border-box; }
+        button { background: var(--primary); color: white; border: none; cursor: pointer; font-weight: 600; }
+        button:hover { opacity: 0.9; }
+        .header-bar { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; margin-bottom: 20px; }
+        .status-badge { background: var(--success); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .badge { background: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin-right: 5px; }
+        .msg-box { border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 16px; background: #fafafa;}
+        .msg-header { font-weight: bold; margin-bottom: 12px; font-size: 16px; color: var(--primary); }
+        pre { background: #f1f5f9; padding: 10px; border-radius: 6px; font-size: 13px; overflow-x: auto; }
     </style>
 </head>
 <body>
-
-    <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h2>🤖 Slik Agent Dashboard</h2>
-            <div id="connectionStatus" class="status">Not Connected</div>
+    <div class="header-bar">
+        <div>
+            <h1>Sliq Dashboard</h1>
+            <p style="margin:0; color:#64748b;">Node: <strong id="agentIdentityDisplay">Loading...</strong></p>
         </div>
-        <div class="row">
-            <input type="text" id="agentUrl" value="http://127.0.0.1:8001" style="flex:1" placeholder="Agent API URL">
-            <button onclick="connect()">Connect</button>
-        </div>
-        
-        <div id="vcardDisplay" style="margin-top: 15px; display:none; padding-top:15px; border-top:1px solid #eee;">
-            <div class="row">
-                <strong>Identity:</strong> <span id="vcName"></span>
-                <strong>Endpoint:</strong> <a id="vcEndpoint" href="#" target="_blank"></a>
-            </div>
-            <div style="margin-top:5px;">
-                <strong>Protocols:</strong> <span id="vcProtocols"></span>
-            </div>
-        </div>
+        <div id="connectionStatus" class="status-badge" style="background: #ef4444;">Connecting...</div>
     </div>
 
-    <div id="app" style="display:none;">
-        <div class="card">
-            <h3>🚀 Start Enactment (Lobby)</h3>
-            <div class="col">
-                <div class="row">
-                    <select id="protocolSelect" onchange="loadRoleOptions()" style="flex:1"></select>
-                    <input type="text" id="roleInput" placeholder="My Role (e.g. Buyer)" style="flex:1">
-                    <input type="text" id="newEnactmentId" placeholder="Custom ID (Optional)" style="flex:1">
-                </div>
-                
-                <button type="button" class="secondary" onclick="togglePeerConfig()" style="width: auto; align-self: flex-start;">⚙️ Configure Peers (Lobby)</button>
-                
-                <div id="peerConfigPanel" class="peer-config">
-                    <small>Specify URLs for other roles in this enactment (Dynamic Binding)</small>
-                    <div id="peerInputs"></div>
-                </div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+        <div class="col">
+            <div class="card">
+                <h3>Join Protocol Enactment</h3>
+                <p style="font-size: 13px; color: #64748b;">Connect this agent to a shared multi-party session.</p>
+                <div class="col">
+                    <label style="font-size: 12px; font-weight: bold;">Protocol:</label>
+                    <select id="protocolSelect" onchange="fetchRoles()">
+                        <option value="">-- Select Protocol --</option>
+                        <option value="Logistics">Logistics</option>
+                        <option value="Purchase">Purchase</option>
+                    </select>
 
-                <button type="button" onclick="startEnactment()">Start Protocol</button>
+                    <label style="font-size: 12px; font-weight: bold; margin-top: 5px;">Agent Role:</label>
+                    <select id="roleSelect" disabled>
+                        <option value="">-- Select Protocol First --</option>
+                    </select>
+
+                    <label style="font-size: 12px; font-weight: bold; margin-top: 5px;">Enactment ID (Shared Key):</label>
+                    <input type="text" id="enactmentId" placeholder="e.g., demo-1">
+                    
+                    <button onclick="startEnactment()" style="margin-top: 10px;">Connect & Listen</button>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>System Status</h3>
+                <p style="font-size: 13px; color: #64748b;">Current Active Enactment: <strong id="activeEnactmentLabel">None</strong></p>
+                <button onclick="fetchActions()" style="background: #64748b;">Refresh State Manually</button>
             </div>
         </div>
 
-        <div class="row" style="align-items: flex-start;">
-            <div class="card" style="flex: 1; min-height: 400px;">
-                <h3>📂 Enactments</h3>
-                <div id="enactmentList" style="display:flex; flex-direction:column; gap:8px;"></div>
-            </div>
+        <div>
+            <div class="card" id="interactionPanel" style="display: none;">
+                <h3>Protocol Execution</h3>
+                
+                <h4>Known Information</h4>
+                <pre id="knowledgeDisplay">{}</pre>
 
-            <div class="card" style="flex: 2; min-height: 400px;">
-                <h3 id="currentEnactmentTitle">Select an enactment...</h3>
-                <div id="enactmentView" style="display:none;">
-                    
-                    <div class="row" style="margin-bottom:10px;">
-                        <small><strong>Peers:</strong> <span id="enactmentPeers"></span></small>
-                    </div>
-
-                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
-                        <div>
-                            <h4>🧠 Knowledge Base</h4>
-                            <pre id="knowledgeDisplay">{}</pre>
-                        </div>
-                        <div>
-                            <h4>⚡ Enabled Messages</h4>
-                            <div id="actionsList">Waiting for state...</div>
-                        </div>
-                    </div>
-                </div>
+                <h4>Available Actions</h4>
+                <div id="actionsContainer"></div>
             </div>
         </div>
     </div>
 
     <script>
-        let BASE_URL = "";
-        let currentEnactment = null;
-        let pollInterval = null;
-        let protocolCache = {};
+        const BASE_URL = window.location.origin;
+        let currentEnactmentId = null;
+        let lastActionsHash = ""; // Tracks UI state to prevent flickering
 
-        async function connect() {
-            BASE_URL = document.getElementById('agentUrl').value.replace(/\/$/, "");
+        window.onload = async () => {
             try {
-                const vcRes = await fetch(`${BASE_URL}/vcard`);
-                const vc = await vcRes.json();
-                
-                document.getElementById('vcName').innerText = vc.agent;
-                document.getElementById('vcEndpoint').innerText = vc.endpoint;
-                document.getElementById('vcEndpoint').href = vc.endpoint;
-                document.getElementById('vcProtocols').innerText = vc.supported_protocols.join(", ");
-                document.getElementById('vcardDisplay').style.display = 'block';
-
-                const pRes = await fetch(`${BASE_URL}/protocols`);
-                const protocols = await pRes.json();
-                const select = document.getElementById('protocolSelect');
-                select.innerHTML = protocols.map(p => `<option value="${p}">${p}</option>`).join('');
-                
-                if (protocols.length > 0) loadRoleOptions();
-
-                document.getElementById('app').style.display = 'block';
-                const status = document.getElementById('connectionStatus');
-                status.innerText = "Connected";
-                status.className = "status ok";
+                const res = await fetch(`${BASE_URL}/vcard`);
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('agentIdentityDisplay').innerText = data.agent;
+                    document.getElementById('connectionStatus').innerText = "Connected";
+                    document.getElementById('connectionStatus').style.background = "var(--success)";
+                }
             } catch (e) {
-                const status = document.getElementById('connectionStatus');
-                status.innerText = "Connection Failed";
-                status.className = "status err";
-                console.error(e);
+                document.getElementById('agentIdentityDisplay').innerText = "API Offline";
             }
-        }
+        };
 
-        async function loadRoleOptions() {
-            const proto = document.getElementById('protocolSelect').value;
-            if (!proto) return;
+        async function fetchRoles() {
+            const protocol = document.getElementById('protocolSelect').value;
+            const roleSelect = document.getElementById('roleSelect');
             
-            const res = await fetch(`${BASE_URL}/protocols/${proto}`);
-            const data = await res.json();
-            protocolCache[proto] = data;
+            if (!protocol) {
+                roleSelect.innerHTML = '<option value="">-- Select Protocol First --</option>';
+                roleSelect.disabled = true;
+                return;
+            }
 
-            const container = document.getElementById('peerInputs');
-            container.innerHTML = "";
-            data.roles.forEach(r => {
-                container.innerHTML += `
-                    <div class="peer-row">
-                        <label style="width:100px;">${r}:</label>
-                        <input type="text" class="peer-url-input" data-role="${r}" placeholder="http://ip:port">
-                    </div>
-                `;
-            });
-        }
-
-        function togglePeerConfig() {
-            const el = document.getElementById('peerConfigPanel');
-            el.style.display = el.style.display === 'none' ? 'block' : 'none';
+            try {
+                const res = await fetch(`${BASE_URL}/protocols/${protocol}`);
+                const data = await res.json();
+                roleSelect.innerHTML = '';
+                data.roles.forEach(role => {
+                    const opt = document.createElement('option');
+                    opt.value = role;
+                    opt.innerText = role;
+                    roleSelect.appendChild(opt);
+                });
+                roleSelect.disabled = false;
+                
+                // Auto-select if agent name exactly matches a protocol role
+                const agentName = document.getElementById('agentIdentityDisplay').innerText;
+                if (data.roles.includes(agentName)) {
+                    roleSelect.value = agentName;
+                }
+            } catch (e) { console.error("Failed to load roles", e); }
         }
 
         async function startEnactment() {
             const protocol = document.getElementById('protocolSelect').value;
-            const role = document.getElementById('roleInput').value;
-            const eid = document.getElementById('newEnactmentId').value;
-            
-            const peers = {};
-            document.querySelectorAll('.peer-url-input').forEach(input => {
-                if (input.value.trim()) {
-                    peers[input.getAttribute('data-role')] = input.value.trim();
-                }
+            const role = document.getElementById('roleSelect').value;
+            const enactmentId = document.getElementById('enactmentId').value.trim();
+
+            if (!protocol || !role || !enactmentId) { 
+                alert("Please fill in Protocol, Role, and Enactment ID."); 
+                return; 
+            }
+
+            const res = await fetch(`${BASE_URL}/protocols/${protocol}/enactments?role=${role}&enactment_id=${enactmentId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ bindings: {} })
             });
 
-            const body = { peers: peers, bindings: {} };
-            let url = `${BASE_URL}/protocols/${protocol}/enactments?role=${role}`;
-            if (eid) url += `&enactment_id=${eid}`;
-
-            try {
-                const res = await fetch(url, { 
-                    method: 'POST', 
-                    headers: {'Content-Type': 'application/json'}, 
-                    body: JSON.stringify(body) 
-                });
-                const data = await res.json();
-                renderEnactmentList(protocol, role, data.enactment_id);
-                selectEnactment(data.enactment_id, protocol, role);
-            } catch (e) {
-                alert("Error: " + e);
+            if (res.ok) {
+                currentEnactmentId = enactmentId;
+                lastActionsHash = ""; // Reset diff hash on new enactment
+                document.getElementById('activeEnactmentLabel').innerText = enactmentId;
+                document.getElementById('interactionPanel').style.display = 'block';
+                fetchActions();
+            } else {
+                alert("Failed to join enactment");
             }
-        }
-
-        function renderEnactmentList(protocol, role, id) {
-            const list = document.getElementById('enactmentList');
-            const btn = document.createElement('button');
-            btn.className = "secondary";
-            btn.style.textAlign = "left";
-            btn.innerHTML = `<strong>${protocol}</strong> <small>(${role})</small><br><span style="font-size:0.8em; opacity:0.8">${id.substring(0,8)}...</span>`;
-            btn.onclick = () => selectEnactment(id, protocol, role);
-            list.prepend(btn);
-        }
-
-        function selectEnactment(id, protocol, role) {
-            currentEnactment = { id, protocol, role };
-            document.getElementById('currentEnactmentTitle').innerText = `${protocol} - ${role}`;
-            document.getElementById('enactmentView').style.display = 'block';
-            
-            if (pollInterval) clearInterval(pollInterval);
-            fetchActions();
-            pollInterval = setInterval(fetchActions, 1000);
         }
 
         async function fetchActions() {
-            if (!currentEnactment) return;
-            const { protocol, id, role } = currentEnactment;
-            
+            if (!currentEnactmentId) return;
             try {
-                const res = await fetch(`${BASE_URL}/protocols/${protocol}/enactments/${id}/actions?role=${role}`);
+                const res = await fetch(`${BASE_URL}/enactments/${currentEnactmentId}/actions`);
                 const data = await res.json();
                 
+                // 1. ALWAYS update the Known Information text block
                 document.getElementById('knowledgeDisplay').innerText = JSON.stringify(data.bindings, null, 2);
-                document.getElementById('enactmentPeers').innerText = Object.keys(data.peers).length ? JSON.stringify(data.peers) : "(Default/Static)";
-
-                const container = document.getElementById('actionsList');
                 
+                // 2. CHECK if the actual actions array has structurally changed
+                const newActionsHash = JSON.stringify(data.actions);
+                if (newActionsHash === lastActionsHash) {
+                    return; // Exit early! Prevents HTML redraw and saves your typing
+                }
+                lastActionsHash = newActionsHash; 
+
+                // 3. Redraw the forms ONLY if actions changed
+                const container = document.getElementById('actionsContainer');
+                container.innerHTML = '';
+
                 if (data.actions.length === 0) {
-                    container.innerHTML = '<div style="color:#888; font-style:italic">No actions available. Waiting...</div>';
-                    return;
+                    container.innerHTML = '<p style="color:#64748b; font-style:italic;">No actions currently enabled. Waiting for peers...</p>';
                 }
 
                 data.actions.forEach(action => {
-                    let box = document.getElementById(`msg-box-${action.message}`);
-                    if (!box) {
-                        box = document.createElement('div');
-                        box.id = `msg-box-${action.message}`;
-                        box.className = 'message-box';
-                        box.innerHTML = `
-                            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                                <strong>✉️ ${action.message}</strong>
-                                <span class="tag">OUT: ${action.outs.join(', ')}</span>
-                            </div>
-                            <div id="inputs-${action.message}"></div>
-                            <button style="width:100%; margin-top:8px;" onclick="send('${action.message}')">Send</button>
-                        `;
-                        container.appendChild(box);
-                    }
+                    const msgDiv = document.createElement('div');
+                    msgDiv.className = 'msg-box';
+                    msgDiv.id = `msg-box-${action.message}`;
                     
-                    const inputContainer = box.querySelector(`#inputs-${action.message}`);
+                    let html = `<div class="msg-header">${action.message}</div><div class="col">`;
                     
-                    action.outs.forEach(param => {
-                        const existingInput = document.getElementById(`input-${action.message}-${param}`);
-                        const knownVal = data.bindings[param] || "";
-                        
-                        if (!existingInput) {
-                            const row = document.createElement('div');
-                            row.className = "param-row";
-                            row.innerHTML = `<label>${param}:</label><input type="text" id="input-${action.message}-${param}" data-param="${param}" value="${knownVal}">`;
-                            inputContainer.appendChild(row);
+                    action.outs.forEach(outItem => {
+                        const outParam = outItem.name || outItem; 
+                        const isKey = outItem.is_key || false;
+
+                        if (isKey) {
+                            html += `<div style="display:flex; align-items:center; gap: 10px; opacity: 0.7;">
+                                <span class="badge" style="background:var(--success); color:white;">AUTO KEY</span> 
+                                <span style="min-width:70px; font-size:13px; font-weight:600;">${outParam}</span>
+                                <span style="font-size: 12px; color: #64748b; font-style: italic;">System managed</span>
+                            </div>`;
                         } else {
-                            if (document.activeElement !== existingInput && knownVal && existingInput.value !== knownVal) {
-                                existingInput.value = knownVal;
-                                existingInput.style.backgroundColor = "#e0f2fe"; 
-                            }
-                            if (knownVal) {
-                                existingInput.setAttribute("readonly", true);
-                            }
+                            html += `<div style="display:flex; align-items:center; gap: 10px;">
+                                <span class="badge">OUT</span> 
+                                <span style="min-width:70px; font-size:13px; font-weight:600;">${outParam}</span>
+                                <input type="text" data-param="${outParam}" placeholder="Value for ${outParam}">
+                            </div>`;
                         }
                     });
+
+                    html += `<button onclick="send('${action.message}')" style="margin-top:10px;">Send ${action.message}</button></div>`;
+                    msgDiv.innerHTML = html;
+                    container.appendChild(msgDiv);
                 });
 
-            } catch (e) {
-                console.error(e);
-            }
+            } catch (e) { console.error("Failed to fetch actions", e); }
         }
 
         async function send(messageName) {
-            const { protocol, id, role } = currentEnactment;
+            if (!currentEnactmentId) return;
             const container = document.getElementById(`msg-box-${messageName}`);
             const payload = {};
             
+            // Gather inputs
             container.querySelectorAll('input').forEach(inp => {
                 if (inp.value) payload[inp.getAttribute('data-param')] = inp.value;
             });
 
-            const knowledge = JSON.parse(document.getElementById('knowledgeDisplay').innerText);
-            const fullPayload = { ...knowledge, ...payload };
-
             try {
-                const res = await fetch(`${BASE_URL}/protocols/${protocol}/enactments/${id}/send/${messageName}?role=${role}`, {
+                const res = await fetch(`${BASE_URL}/enactments/${currentEnactmentId}/send/${messageName}`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ payload: fullPayload })
+                    body: JSON.stringify({ payload: payload })
                 });
+                
                 if (res.ok) {
-                    alert("Status: sent"); // RESTORED ALERT
-                    fetchActions();
+                    fetchActions(); 
                 } else {
                     const err = await res.json();
-                    alert("Error: " + err.detail);
+                    // Force JSON objects/arrays to strings to expose exact system faults
+                    const errMsg = typeof err.detail === 'object' ? JSON.stringify(err.detail, null, 2) : err.detail;
+                    alert("Protocol Violation or Error:\n" + errMsg);
                 }
             } catch (e) {
                 alert("Network Error: " + e);
             }
         }
+        
+        // Auto-poll state every 3 seconds
+        setInterval(() => {
+            if (currentEnactmentId && document.getElementById('interactionPanel').style.display === 'block') {
+                fetchActions();
+            }
+        }, 3000);
     </script>
 </body>
 </html>
