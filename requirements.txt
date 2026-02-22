@@ -4,5 +4,7 @@ pydantic
 httpx
 aiohttp
 jinja2
+croniter
+rich
 
 -e git+https://github.com/cagan-bayram/bspl.git#egg=bspl
