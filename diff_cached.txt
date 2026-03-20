@@ -1,0 +1,3334 @@
+diff --git a/agent_api.py b/agent_api.py
+index 32b9a77..9f64364 100644
+--- a/agent_api.py
++++ b/agent_api.py
+@@ -2,391 +2,802 @@ from __future__ import annotations
+ 
+ import asyncio
+ import os
+-import sys
+ import uuid
+ import json
+ import logging
++import re
+ from pathlib import Path
+-from typing import Any, Dict, List, Tuple, Optional
++from typing import Any, Dict, List, Optional
+ from urllib.parse import urlparse
+ from contextlib import asynccontextmanager
+ 
+-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
++from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+ from fastapi.middleware.cors import CORSMiddleware
+-from fastapi.staticfiles import StaticFiles
+ from fastapi.responses import FileResponse
+ from pydantic import BaseModel
+ 
+ import bspl
+ from bspl.adapter.core import Adapter
+-from bspl.adapter.http_adapter import HTTPEmitter, HTTPReceiver
++from bspl.adapter.http_adapter import HTTPEmitter
+ from bspl.adapter.event import InitEvent
+ from bspl.adapter.message import Message
+ 
+-# -------------------------
+-# Config (Static Topology)
+-# -------------------------
++# ─────────────────────────────────────────────────────────────────
++# Static config (env vars — only node-level, not agent-level)
++# ─────────────────────────────────────────────────────────────────
+ PROTOCOL_DIR = Path(os.getenv("PROTOCOL_DIR", "protocols/reference"))
+-GENERATED_DIR = Path(os.getenv("BSPL_GENERATED_DIR", ".bspl_generated")).resolve()
+-
+-API_PORT = int(os.getenv("API_PORT", "8001"))
+-RECEIVER_PORT = int(os.getenv("RECEIVER_PORT", "9001"))
+-MESSAGES_PATH = os.getenv("MESSAGES_PATH", "/messages")
+-AGENT_NAME = os.getenv("AGENT_NAME", "GenericAgent").strip()
+-PUBLIC_HOST = os.getenv("PUBLIC_HOST", "127.0.0.1") 
+-DATA_FILE = Path(os.getenv("BSPL_DATA_FILE", f".agent_state_{AGENT_NAME}.json"))
+-BASE_URLS_RAW = os.getenv("BASE_URLS", "")
+-
+-logging.basicConfig(level=logging.INFO)
+-logger = logging.getLogger(f"agent_api.{AGENT_NAME}")
+-
+-def parse_base_urls(raw: str) -> Dict[str, str]:
+-    raw = (raw or "").strip()
+-    if not raw: return {}
+-    out = {}
+-    for part in raw.split(","):
+-        if "=" in part:
+-            k, v = part.split("=", 1)
+-            out[k.strip()] = v.strip().rstrip("/")
+-    return out
+-
+-BASE_URLS = parse_base_urls(BASE_URLS_RAW)
+-
+-class DynamicHTTPEmitter(HTTPEmitter):
+-    async def send(self, message) -> None:
+-        dest = message.dest
+-        if isinstance(dest, tuple):
+-            host, port = dest
+-            url = f"http://{host}:{port}{self.path}"
+-            payload = self.encode(message)
+-            try:
+-                resp = await self.client.post(url, json=json.loads(payload))
+-                self.stats["bytes"] += len(payload)
+-                self.stats["packets"] += 1
+-                resp.raise_for_status()
+-            except Exception as exc:
+-                logger.error(f"Dynamic send failed to {url}: {exc}")
+-                raise
++API_PORT     = int(os.getenv("API_PORT", "8001"))
++AGENT_NAME   = os.getenv("AGENT_NAME", "").strip()
++PUBLIC_HOST  = os.getenv("PUBLIC_HOST", "127.0.0.1")
++
++STORAGE_DIR   = Path("storage")
++REGISTRY_FILE = STORAGE_DIR / "agent_registry.json"
++STATE_FILE    = STORAGE_DIR / "system_state.json"
++
++logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
++logger = logging.getLogger("sliq")
++
++# ─────────────────────────────────────────────────────────────────
++# Runtime state
++# ─────────────────────────────────────────────────────────────────
++AGENT_ID: str = ""   # Set at startup from registry
++
++# active_agents[mas_id] = {
++#   "adapter":    Adapter,
++#   "config":     { mas_id, protocol_name, role, topology: Dict[str,str] },
++#   "enactments": { eid: { protocol, role, bindings } }
++# }
++active_agents: Dict[str, dict] = {}
++
++
++# ─────────────────────────────────────────────────────────────────
++# NoOpReceiver — we handle inbound messages via FastAPI route
++# ─────────────────────────────────────────────────────────────────
++class NoOpReceiver:
++    async def task(self, adapter):
++        pass  # FastAPI POST /{agent_id}/messages does the receiving
++
++    async def stop(self):
++        pass
++
++
++# ─────────────────────────────────────────────────────────────────
++# Utility helpers
++# ─────────────────────────────────────────────────────────────────
++def safe_list(x):
++    try:
++        return list(x)
++    except Exception:
++        return []
++
++
++def normalize_name(n: str) -> str:
++    return (n[0].upper() + n[1:]) if n else n
++
++
++def load_protocol(protocol_name: str):
++    pn = normalize_name(protocol_name)
++    path = PROTOCOL_DIR / f"{pn.lower()}.bspl"
++    if not path.exists():
++        path = PROTOCOL_DIR / f"{pn}.bspl"
++    if not path.exists():
++        raise HTTPException(404, f"Protocol '{pn}' not found in {PROTOCOL_DIR}")
++    spec = bspl.load_file(str(path))
++    return spec.protocols[pn], spec
++
++
++def resolve_agent_id(name: str) -> str:
++    """Return persistent UUID for agent name; create it if first use."""
++    STORAGE_DIR.mkdir(exist_ok=True)
++    registry: Dict[str, str] = {}
++    if REGISTRY_FILE.exists():
++        try:
++            registry = json.loads(REGISTRY_FILE.read_text())
++        except Exception:
++            pass
++    key = name.strip().lower()
++    if key not in registry:
++        registry[key] = str(uuid.uuid4())
++        REGISTRY_FILE.write_text(json.dumps(registry, indent=2))
++        logger.info(f"New agent '{name}' registered → {registry[key]}")
++    else:
++        logger.info(f"Agent '{name}' restored   → {registry[key]}")
++    return registry[key]
++
++
++# ─────────────────────────────────────────────────────────────────
++# Core join logic (also called by StateManager.load for recovery)
++# ─────────────────────────────────────────────────────────────────
++class JoinBody(BaseModel):
++    mas_id:        str
++    protocol_name: str
++    role:          str
++    topology:      Dict[str, str]   # { other_role: "http://host:port/{their_uuid}" }
++
++
++async def _do_join(body: JoinBody) -> dict:
++    """Create Adapter + register in active_agents. Idempotent."""
++    if body.mas_id in active_agents:
++        return active_agents[body.mas_id]
++
++    proto, _ = load_protocol(body.protocol_name)
++    protocol_name = normalize_name(body.protocol_name)
++    topology = body.topology
++
++    # HTTPEmitter — sends to peer base URLs + "/messages?mas_id=..."
++    # This ensures the receiver routes the message to the correct MAS session!
++    emitter = HTTPEmitter(base_urls=topology, path=f"/messages?mas_id={body.mas_id}")
++
++    # roles_map: Role object → agent-name string
++    # We use the role name as agent name (one agent per role in our model)
++    roles_map: Dict = {r: r.name for r in proto.roles.values()}
++
++    # agents dict: agent_name → [(host, port)] endpoint list
++    agents: Dict[str, list] = {}
++    for r in proto.roles.values():
++        if r.name == body.role:
++            # Our own address — FastAPI port (receiver is NoOp, so value only
++            # needs to be valid for the Adapter agents dict structure)
++            agents[r.name] = [("127.0.0.1", API_PORT)]
++        elif r.name in topology:
++            parsed = urlparse(topology[r.name])
++            host = parsed.hostname or "127.0.0.1"
++            port = parsed.port or 80
++            agents[r.name] = [(host, port)]
+         else:
+-            raise RuntimeError(f"Unknown destination format: '{dest}'")
++            agents[r.name] = [("127.0.0.1", API_PORT)]
++
++    systems = {"default": {"protocol": proto, "roles": roles_map}}
++
++    adapter = Adapter(
++        name=body.role,
++        systems=systems,
++        agents=agents,
++        emitter=emitter,
++        receiver=NoOpReceiver(),
++    )
++
++    # Start adapter background event loop
++    adapter.events  = asyncio.Queue()
++    adapter.running = True
++    asyncio.create_task(adapter.update_loop())
++    await adapter.signal(InitEvent())
++
++    slot = {
++        "adapter":    adapter,
++        "config":     {
++            "mas_id":        body.mas_id,
++            "protocol_name": protocol_name,
++            "role":          body.role,
++            "topology":      topology,
++        },
++        "enactments": {},
++    }
++    active_agents[body.mas_id] = slot
++    logger.info(f"Joined MAS '{body.mas_id}' as {body.role} in {protocol_name}")
++    return slot
+ 
+-adapters: Dict[Tuple[str, str], Adapter] = {}
+-adapter_started: Dict[Tuple[str, str], bool] = {}
+-_adapter_init_lock = asyncio.Lock()
+-enactments: Dict[str, Dict[str, Any]] = {}
+ 
++# ─────────────────────────────────────────────────────────────────
++# State persistence
++# ─────────────────────────────────────────────────────────────────
+ class StateManager:
++
+     @staticmethod
+     def save():
+-        data = {"enactments": enactments, "history": []}
+-        for adapter in adapters.values():
++        STORAGE_DIR.mkdir(exist_ok=True)
++        data: Dict[str, dict] = {}
++        for mas_id, slot in active_agents.items():
++            history_items = []
++            adapter = slot["adapter"]
+             for msg in adapter.history.messages():
+-                if hasattr(msg, 'schema') and hasattr(msg.schema, 'protocol'):
+-                    data["history"].append({
+-                        "protocol": msg.schema.protocol.name, "message": msg.schema.name,
+-                        "payload": msg.payload, "meta": msg.meta, "system": msg.system
++                try:
++                    schema = getattr(msg, "schema", None)
++                    if schema is None:
++                        continue
++                    raw_payload = getattr(msg, "payload", {}) or {}
++                    history_items.append({
++                        "schema":  schema.qualified_name,
++                        "payload": {str(getattr(k, "name", k)): v for k, v in raw_payload.items()},
++                        "meta":    {k: str(v) for k, v in (getattr(msg, "meta", {}) or {}).items()},
++                        "system":  getattr(msg, "system", "default"),
+                     })
++                except Exception:
++                    pass
++
++            data[mas_id] = {
++                "config":     slot["config"],
++                "enactments": slot.get("enactments", {}),
++                "history":    history_items,
++            }
++
++        # Merge with any other agents' data already in the file
++        existing: Dict = {}
++        if STATE_FILE.exists():
++            try:
++                existing = json.loads(STATE_FILE.read_text())
++            except Exception:
++                pass
++        existing[AGENT_ID] = data
++
+         try:
+-            with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2, default=str)
+-        except Exception as e: logger.error(f"Failed to save state: {e}")
++            STATE_FILE.write_text(json.dumps(existing, indent=2, default=str))
++        except Exception as e:
++            logger.error(f"Failed to save state: {e}")
+ 
+     @staticmethod
+     async def load():
+-        if not DATA_FILE.exists(): return
++        if not STATE_FILE.exists():
++            return
+         try:
+-            with open(DATA_FILE, 'r') as f: data = json.load(f)
+-            enactments.update(data.get("enactments", {}))
+-            
+-            needed_adapters = set((rec['protocol'], rec['role']) for rec in enactments.values())
+-            for prot, rol in needed_adapters: await ensure_adapter(prot, rol)
++            all_data = json.loads(STATE_FILE.read_text())
++            agent_data: Dict = all_data.get(AGENT_ID, {})
+ 
+-            for item in data.get("history", []):
++            for mas_id, slot_data in agent_data.items():
++                cfg = slot_data.get("config", {})
+                 try:
+-                    _, spec = load_protocol(item['protocol'])
+-                    schema = spec.protocols[normalize_protocol_name(item['protocol'])].messages[item['message']]
+-                    msg = Message(schema=schema, payload=item['payload'], meta=item.get('meta', {}), system=item.get('system', 'default'))
+-                    for (ap, ar), adapter in adapters.items():
+-                        if ap == normalize_protocol_name(item['protocol']):
+-                            if not adapter.history.context(msg).find(schema): adapter.history.add(msg)
+-                except Exception: pass
+-        except Exception as e: logger.error(f"Failed to load state: {e}")
+-
++                    body = JoinBody(
++                        mas_id=cfg["mas_id"],
++                        protocol_name=cfg["protocol_name"],
++                        role=cfg["role"],
++                        topology=cfg.get("topology", {}),
++                    )
++                    await _do_join(body)
++                except Exception as e:
++                    logger.warning(f"Could not restore MAS '{mas_id}': {e}")
++                    continue
++
++                # Restore enactment records
++                active_agents[mas_id]["enactments"] = slot_data.get("enactments", {})
++
++                # Replay message history into adapter
++                adapter = active_agents[mas_id]["adapter"]
++                proto, _ = load_protocol(cfg["protocol_name"])
++                for item in slot_data.get("history", []):
++                    try:
++                        schema_key = item.get("schema", "")
++                        # qualified_name is "ProtocolName.MessageName"
++                        msg_name = schema_key.split(".")[-1]
++                        schema = proto.messages.get(msg_name)
++                        if schema is None:
++                            continue
++                        msg = Message(
++                            schema=schema,
++                            payload=item.get("payload", {}),
++                            meta=item.get("meta", {}),
++                            system=item.get("system", "default"),
++                        )
++                        if not adapter.history.context(msg).find(schema):
++                            adapter.history.add(msg)
++                    except Exception:
++                        pass
++
++            logger.info(f"State restored: {len(agent_data)} MAS session(s)")
++        except Exception as e:
++            logger.error(f"Failed to load state: {e}")
++
++
++# ─────────────────────────────────────────────────────────────────
++# FastAPI app
++# ─────────────────────────────────────────────────────────────────
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
++    global AGENT_ID
++    if AGENT_NAME:
++        AGENT_ID = resolve_agent_id(AGENT_NAME)
++    else:
++        # Unnamed node — transient UUID (no persistence possible)
++        AGENT_ID = str(uuid.uuid4())
++        logger.warning("AGENT_NAME not set; node identity is transient this session")
++    logger.info(f"Node identity: '{AGENT_NAME}' → {AGENT_ID}  (API on :{API_PORT})")
+     await StateManager.load()
+     yield
+     StateManager.save()
+ 
+-app = FastAPI(title=f"Sliq Agent: {AGENT_NAME}", lifespan=lifespan)
+-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+-app.mount("/static", StaticFiles(directory="."), name="static")
+ 
+-@app.get("/dashboard.html")
+-async def read_dashboard(): return FileResponse('dashboard.html')
++app = FastAPI(title="Sliq BSPL Node", lifespan=lifespan)
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=["*"],
++    allow_credentials=True,
++    allow_methods=["*"],
++    allow_headers=["*"],
++)
++
++
++# ─────────────────────────────────────────────────────────────────
++# UI routes — serve dashboard.html for both root and agent views
++# ─────────────────────────────────────────────────────────────────
++@app.get("/")
++async def root():
++    return FileResponse("dashboard.html")
++
++
++@app.get("/{agent_id}/dashboard")
++async def agent_dashboard(agent_id: str):
++    if agent_id != AGENT_ID:
++        raise HTTPException(404, "Unknown agent ID")
++    return FileResponse("dashboard.html")
++
++
++# ─────────────────────────────────────────────────────────────────
++# Identity & node status
++# ─────────────────────────────────────────────────────────────────
++@app.get("/api/identity")
++def get_identity():
++    return {
++        "agent_name": AGENT_NAME,
++        "agent_id":   AGENT_ID,
++        "api_port":   API_PORT,
++        "public_host": PUBLIC_HOST,
++        "webhook_base": f"http://{PUBLIC_HOST}:{API_PORT}/{AGENT_ID}",
++    }
+ 
+-def safe_list(x):
+-    try: return list(x)
+-    except: return []
+ 
+-def normalize_protocol_name(n: str) -> str: return (n[0].upper() + n[1:]) if n else n
++@app.get("/api/agents")
++def get_agents():
++    sessions = []
++    for mas_id, slot in active_agents.items():
++        cfg = slot["config"]
++        sessions.append({
++            "mas_id":          mas_id,
++            "protocol":        cfg["protocol_name"],
++            "role":            cfg["role"],
++            "enactment_ids":   list(slot["enactments"].keys()),
++            "dashboard_url":   f"/{AGENT_ID}/dashboard",
++        })
++    return {
++        "agent_id":    AGENT_ID,
++        "agent_name":  AGENT_NAME,
++        "mas_sessions": sessions,
++    }
+ 
+-def load_protocol(protocol_name: str):
+-    protocol_name = normalize_protocol_name(protocol_name)
+-    path = PROTOCOL_DIR / f"{protocol_name.lower()}.bspl"
+-    if not path.exists(): path = PROTOCOL_DIR / f"{protocol_name}.bspl"
+-    if not path.exists(): raise HTTPException(404, f"Protocol {protocol_name} not found")
+-    spec = bspl.load_file(str(path))
+-    return spec.protocols[protocol_name], spec
+ 
+-async def ensure_adapter(protocol_name: str, role_name: str) -> Adapter:
+-    protocol_name = normalize_protocol_name(protocol_name)
+-    key = (protocol_name, role_name)
+-    if key in adapters: return adapters[key]
++# ─────────────────────────────────────────────────────────────────
++# Protocol discovery
++# ─────────────────────────────────────────────────────────────────
++@app.get("/protocols")
++def list_protocols():
++    names: List[str] = []
++    if PROTOCOL_DIR.exists():
++        for f in sorted(PROTOCOL_DIR.glob("*.bspl")):
++            names.append(normalize_name(f.stem))
++    return {"protocols": names}
++
++
++@app.get("/protocols/{protocol_name}")
++def get_protocol_spec(protocol_name: str):
++    proto, _ = load_protocol(protocol_name)
++
++    messages = []
++    for msg in proto.messages.values():
++        ins_list, outs_list = [], []
++
++        for ref in safe_list(getattr(msg, "ins", [])):
++            p = ref.param if hasattr(ref, "param") else ref
++            p_name = str(getattr(p, "name", p)).strip()
++            param_obj = proto.public_parameters.get(p_name) if hasattr(proto, "public_parameters") else None
++            is_key = (param_obj and getattr(param_obj, "key", None) == "key")
++            ins_list.append({
++                "name": p_name,
++                "key":  is_key,
++            })
++
++        for ref in safe_list(getattr(msg, "outs", [])):
++            p = ref.param if hasattr(ref, "param") else ref
++            p_name = str(getattr(p, "name", p)).strip()
++            param_obj = proto.public_parameters.get(p_name) if hasattr(proto, "public_parameters") else None
++            is_key = (param_obj and getattr(param_obj, "key", None) == "key")
++            outs_list.append({
++                "name": p_name,
++                "key":  is_key,
++            })
++
++        messages.append({
++            "name":       msg.name,
++            "sender":     str(getattr(msg.sender, "name", msg.sender)),
++            "recipients": [str(getattr(r, "name", r)) for r in safe_list(msg.recipients)],
++            "ins":        ins_list,
++            "outs":       outs_list,
++        })
+ 
+-    async with _adapter_init_lock:
+-        if key in adapters: return adapters[key]
+-        proto, _ = load_protocol(protocol_name)
+-        emitter = DynamicHTTPEmitter(base_urls=BASE_URLS, path=MESSAGES_PATH)
+-        receiver = HTTPReceiver(host="0.0.0.0", port=RECEIVER_PORT, path=MESSAGES_PATH)
++    return {
++        "name":     normalize_name(protocol_name),
++        "roles":    list(proto.roles.keys()),
++        "messages": messages,
++    }
+ 
+-        roles_map = {r: r.name for r in proto.roles.values()}
+-        agents = {r.name: [(urlparse(BASE_URLS[r.name]).hostname or "127.0.0.1", urlparse(BASE_URLS[r.name]).port or 80)] if r.name in BASE_URLS else [("127.0.0.1", RECEIVER_PORT)] for r in proto.roles.values()}
+ 
+-        adapter = Adapter(name=role_name, systems={"default": {"protocol": proto, "roles": roles_map}}, agents=agents, emitter=emitter, receiver=receiver)
+-        adapters[key] = adapter
++# ─────────────────────────────────────────────────────────────────
++# Join a MAS
++# ─────────────────────────────────────────────────────────────────
++@app.post("/api/join")
++async def api_join(body: JoinBody, background_tasks: BackgroundTasks):
++    if body.mas_id in active_agents:
++        raise HTTPException(409, f"Already joined MAS '{body.mas_id}' in this session")
++    await _do_join(body)
++    background_tasks.add_task(StateManager.save)
++    return {
++        "status":        "joined",
++        "mas_id":        body.mas_id,
++        "role":          body.role,
++        "dashboard_url": f"/{AGENT_ID}/dashboard",
++    }
+ 
+-        if not adapter_started.get(key):
+-            from asyncio.queues import Queue
+-            adapter.events = Queue()
+-            adapter.running = True
+-            asyncio.create_task(adapter.update_loop())
+-            asyncio.create_task(receiver.task(adapter))
+-            await adapter.signal(InitEvent())
+-            adapter_started[key] = True
+ 
+-        return adapter
++# ─────────────────────────────────────────────────────────────────
++# Inbound peer message webhook
++# ─────────────────────────────────────────────────────────────────
++@app.post("/{agent_id}/messages")
++async def receive_message(agent_id: str, request: Request, background_tasks: BackgroundTasks, mas_id: Optional[str] = None):
++    if agent_id != AGENT_ID:
++        raise HTTPException(404, "Unknown agent")
+ 
+-@app.get("/vcard")
+-def get_vcard(): return {"agent": AGENT_NAME, "endpoint": f"http://{PUBLIC_HOST}:{RECEIVER_PORT}{MESSAGES_PATH}"}
++    try:
++        data = await request.json()
++    except Exception:
++        raise HTTPException(400, "Invalid JSON body")
++
++    schema_key = data.get("schema", "")
++    target_slot: Optional[dict] = None
++
++    # Precise routing if the sender provided the MAS ID in the webhook URL
++    if mas_id and mas_id in active_agents:
++        slot = active_agents[mas_id]
++        if schema_key in slot["adapter"].messages:
++            target_slot = slot
++
++    # Fallback to scanning all sessions if no/invalid MAS ID provided
++    if target_slot is None:
++        for slot in active_agents.values():
++            if schema_key in slot["adapter"].messages:
++                target_slot = slot
++                break
++
++    if target_slot is None:
++        raise HTTPException(404, f"No active adapter handles schema '{schema_key}'")
++
++    # ── Invitation model ─────────────────────────────────────────────
++    # If this message carries an enactment ID we don't know about,
++    # auto-create the record so the receiver's dashboard shows it
++    # without requiring a manual "Start Enactment" click.
++    inbound_eid = data.get("meta", {}).get("enactment")
++    inbound_payload = data.get("payload", {})
++    if inbound_eid:
++        enactments = target_slot["enactments"]
++        if inbound_eid not in enactments:
++            cfg = target_slot["config"]
++            enactments[inbound_eid] = {
++                "protocol": cfg["protocol_name"],
++                "role":     cfg["role"],
++                "bindings": dict(inbound_payload),
++            }
++            logger.info(
++                f"[Invitation] Auto-created enactment '{inbound_eid}' "
++                f"in MAS '{cfg['mas_id']}' (triggered by incoming {schema_key})"
++            )
++            background_tasks.add_task(StateManager.save)
+ 
+-@app.get("/protocols")
+-def get_protocols():
+-    return {"protocols": ["Logistics", "Purchase"]}
++    await target_slot["adapter"].receive(data)
++    background_tasks.add_task(StateManager.save)
++    return {"status": "ok"}
+ 
+-@app.get("/protocols/{protocol_name}")
+-def get_protocol_details(protocol_name: str):
+-    proto, _ = load_protocol(protocol_name)
+-    return {"roles": list(proto.roles.keys())}
+ 
+-class StartEnactmentBody(BaseModel):
+-    bindings: Dict[str, Any] = {}
+-    peers: Dict[str, str] = {}
++# ─────────────────────────────────────────────────────────────────
++# Start a protocol enactment
++# ─────────────────────────────────────────────────────────────────
++class EnactmentBody(BaseModel):
++    enactment_id: Optional[str] = None
++    bindings:     Dict[str, Any] = {}
++
+ 
+-@app.post("/protocols/{protocol_name}/enactments")
++@app.post("/{agent_id}/enactments")
+ async def start_enactment(
+-    protocol_name: str,
+-    body: StartEnactmentBody,
++    agent_id: str,
++    body: EnactmentBody,
+     background_tasks: BackgroundTasks,
+-    role: Optional[str] = Query(None),
+-    enactment_id: Optional[str] = Query(None),
++    mas_id: str = Query(..., description="Which MAS session to enact under"),
+ ):
+-    protocol_name = normalize_protocol_name(protocol_name)
+-    if not role and AGENT_NAME: role = AGENT_NAME
+-    if not role: raise HTTPException(400, "Role required")
+-
+-    await ensure_adapter(protocol_name, role)
+-
+-    eid = enactment_id.strip() if enactment_id else str(uuid.uuid4())
+-    
+-    enactments[eid] = {
+-        "protocol": protocol_name, 
+-        "role": role, 
+-        "bindings": dict(body.bindings or {}),
+-        "peers": dict(body.peers or {})
++    if agent_id != AGENT_ID:
++        raise HTTPException(404, "Unknown agent")
++    if mas_id not in active_agents:
++        raise HTTPException(404, f"Not joined MAS '{mas_id}'")
++
++    slot = active_agents[mas_id]
++    eid  = (body.enactment_id or "").strip() or str(uuid.uuid4())
++
++    if eid in slot["enactments"]:
++        return {
++            "enactment_id": eid,
++            "mas_id":       mas_id,
++            "role":         slot["config"]["role"],
++            "status":       "already_exists",
++        }
++
++    slot["enactments"][eid] = {
++        "protocol": slot["config"]["protocol_name"],
++        "role":     slot["config"]["role"],
++        "bindings": dict(body.bindings),
+     }
+-    
+-    logger.info(f"Enactment {eid} started. Peers: {enactments[eid]['peers']}")
+     background_tasks.add_task(StateManager.save)
+-    return {"protocol": protocol_name, "role": role, "enactment_id": eid, "bindings": enactments[eid]["bindings"]}
+-
+-@app.get("/enactments/{enactment_id}/actions")
+-async def get_actions(enactment_id: str, role: Optional[str] = None):
+-    if enactment_id not in enactments: raise HTTPException(404, "Enactment not found")
+-    record = enactments[enactment_id]
+-    protocol_name = record["protocol"]
+-    role_name = str(role if role else record.get("role", AGENT_NAME))
+-    
+-    adapter = await ensure_adapter(protocol_name, role_name)
++    return {
++        "enactment_id": eid,
++        "mas_id":       mas_id,
++        "role":         slot["config"]["role"],
++        "status":       "created",
++    }
++
++
++# ─────────────────────────────────────────────────────────────────
++# Get enabled actions for an enactment
++# ─────────────────────────────────────────────────────────────────
++@app.get("/{agent_id}/enactments/{enactment_id}/actions")
++async def get_actions(
++    agent_id:     str,
++    enactment_id: str,
++    mas_id:       str = Query(...),
++):
++    if agent_id != AGENT_ID:
++        raise HTTPException(404, "Unknown agent")
++    if mas_id not in active_agents:
++        raise HTTPException(404, f"Not joined MAS '{mas_id}'")
++
++    slot = active_agents[mas_id]
++    adapter = slot["adapter"]
++    enactments = slot["enactments"]
++
++    if enactment_id not in enactments:
++        raise HTTPException(404, "Enactment not found")
++
++    record   = enactments[enactment_id]
+     bindings = record["bindings"]
+-    updated = False
+-
+-    # 1. Update Knowledge Base strictly from actuality (History)
+-    if hasattr(adapter, "history"):
+-        for m in list(adapter.history.messages()):
+-            raw_payload = getattr(m, "payload", {}) or {}
+-            
+-            # CRITICAL: Force primitive string cast to annihilate AST Symbol bleed
+-            payload = {str(getattr(k, 'name', k)).strip(): v for k, v in raw_payload.items()}
+-            
+-            meta = getattr(m, "meta", {}) or {}
+-            is_mine = (meta.get("enactment") == enactment_id)
+-            
+-            # Universal match: Check meta tag OR see if the payload shares our Enactment ID
+-            if not is_mine and payload:
+-                if enactment_id in payload.values(): is_mine = True
+-                elif bindings:
+-                    shared_keys = set(payload.keys()).intersection(set(bindings.keys()))
+-                    if any(payload[k] == bindings[k] for k in shared_keys): is_mine = True
+-            
+-            if is_mine:
+-                # Deduce authorized parameters for this historical message
+-                msg_schema = getattr(m, "schema", None)
+-                valid_params = set()
+-                if msg_schema:
+-                    for p in safe_list(getattr(msg_schema, 'ins', [])) + safe_list(getattr(msg_schema, 'outs', [])):
+-                        param_obj = p.param if hasattr(p, 'param') else p
+-                        valid_params.add(str(getattr(param_obj, 'name', param_obj)).strip())
+-
+-                for k, v in payload.items():
+-                    # Reject any information not explicitly governed by the protocol schema
+-                    if valid_params and k not in valid_params:
+-                        continue
+-                    if k not in bindings or bindings[k] != v:
+-                        bindings[k] = v
+-                        updated = True
+-    if updated: StateManager.save()
++    updated  = False
+ 
++    proto = None
++    protocol_keys = set()
++    try:
++        proto, _ = load_protocol(slot["config"]["protocol_name"])
++        if hasattr(proto, "public_parameters"):
++            for p_name, param_obj in proto.public_parameters.items():
++                if getattr(param_obj, "key", None) == "key":
++                    protocol_keys.add(p_name.strip())
++    except Exception:
++        pass
++
++    # ── 1. Sync bindings from history ──────────────────────────────
++    for m in list(adapter.history.messages()):
++        raw_payload = getattr(m, "payload", {}) or {}
++        payload = {str(getattr(k, "name", k)).strip(): v for k, v in raw_payload.items()}
++        meta    = getattr(m, "meta", {}) or {}
++
++        is_mine = meta.get("enactment") == enactment_id
++        if not is_mine and payload:
++            if enactment_id in payload.values():
++                is_mine = True
++            elif bindings and protocol_keys:
++                shared = set(payload.keys()) & set(bindings.keys()) & protocol_keys
++                if shared and all(payload[k] == bindings[k] for k in shared):
++                    is_mine = True
++
++        if is_mine:
++            msg_schema  = getattr(m, "schema", None)
++            valid_params = set()
++            if msg_schema:
++                for ref in safe_list(getattr(msg_schema, "ins", [])) + safe_list(getattr(msg_schema, "outs", [])):
++                    p = ref.param if hasattr(ref, "param") else ref
++                    valid_params.add(str(getattr(p, "name", p)).strip())
++            for k, v in payload.items():
++                if valid_params and k not in valid_params:
++                    continue
++                if k not in bindings or bindings[k] != v:
++                    bindings[k] = v
++                    updated = True
++
++    if updated:
++        StateManager.save()
++
++    # ── 2. Build actions from enabled_messages ──────────────────────
+     actions = []
+-    # 2. Process enabled actions
+     for m in adapter.enabled_messages.messages():
+         schema = getattr(m, "schema", m)
+-        
+-        # 3. Causality Cull: Remove schemas already actualized in history
++
++        # Causality cull — skip if already sent in this enactment
+         already_enacted = False
+-        if hasattr(adapter, "history"):
+-            for hist_m in adapter.history.messages():
+-                h_schema = getattr(hist_m, "schema", None)
+-                h_raw_payload = getattr(hist_m, "payload", {}) or {}
+-                
+-                # CRITICAL: Second string coercion block for the history cull
+-                h_payload = {str(getattr(k, 'name', k)).strip(): v for k, v in h_raw_payload.items()}
+-                h_meta = getattr(hist_m, "meta", {}) or {}
+-                
+-                h_is_mine = (h_meta.get("enactment") == enactment_id)
+-                if not h_is_mine and h_payload:
+-                    if enactment_id in h_payload.values(): h_is_mine = True
+-                    elif bindings:
+-                        s_keys = set(h_payload.keys()).intersection(set(bindings.keys()))
+-                        if any(h_payload[k] == bindings[k] for k in s_keys): h_is_mine = True
+-
+-                if h_schema == schema and h_is_mine:
+-                    already_enacted = True
+-                    break
+-        if already_enacted: continue
+-
+-        known_context = {getattr(p, "name", str(p)): bindings[getattr(p, "name", str(p))] 
+-                         for p in safe_list(getattr(schema, "ins", [])) 
+-                         if getattr(p, "name", str(p)) in bindings}
+-        
++        for hm in adapter.history.messages():
++            h_schema  = getattr(hm, "schema", None)
++            h_payload = {str(getattr(k, "name", k)).strip(): v for k, v in (getattr(hm, "payload", {}) or {}).items()}
++            h_meta    = getattr(hm, "meta", {}) or {}
++            h_mine = h_meta.get("enactment") == enactment_id
++            if not h_mine and h_payload:
++                if enactment_id in h_payload.values():
++                    h_mine = True
++                elif bindings and protocol_keys:
++                    sc = set(h_payload.keys()) & set(bindings.keys()) & protocol_keys
++                    if sc and all(h_payload[k] == bindings[k] for k in sc):
++                        h_mine = True
++            if h_schema == schema and h_mine:
++                already_enacted = True
++                break
++        if already_enacted:
++            continue
++
++        known_ins = {
++            getattr(p, "name", str(p)): bindings[getattr(p, "name", str(p))]
++            for p in safe_list(getattr(schema, "ins", []))
++            if getattr(p, "name", str(p)) in bindings
++        }
++
+         outs_data = []
+         for x in safe_list(getattr(schema, "outs", [])):
+-            p = x.param if hasattr(x, 'param') else x
+-            x_name = str(getattr(p, 'name', x))
+-            x_is_key = bool(getattr(p, 'key', False) or getattr(p, 'is_key', False) or 'key' in str(p).lower().split())
+-            if not x_is_key:
+-                outs_data.append(x_name)
+-            
++            p      = x.param if hasattr(x, "param") else x
++            p_name = str(getattr(p, "name", x)).strip()
++            is_key = p_name in protocol_keys
++            outs_data.append({"name": p_name, "is_key": is_key})
++
+         actions.append({
+-            "message": schema.name,
+-            "ins": [getattr(x, 'name', str(x)) for x in safe_list(getattr(schema, "ins", []))],
+-            "outs": outs_data,
+-            "known": known_context
++            "message":    schema.name,
++            "sender":     str(getattr(schema.sender, "name", schema.sender)),
++            "recipients": [str(getattr(r, "name", r)) for r in safe_list(schema.recipients)],
++            "ins":        [getattr(x, "name", str(x)) for x in safe_list(getattr(schema, "ins", []))],
++            "outs":       outs_data,
++            "known":      known_ins,
+         })
+ 
+-    return {"enactment_id": enactment_id, "bindings": bindings, "peers": record.get("peers", {}), "actions": actions}
++    return {
++        "enactment_id": enactment_id,
++        "mas_id":       mas_id,
++        "role":         record["role"],
++        "bindings":     bindings,
++        "actions":      actions,
++    }
+ 
+-class SendBody(BaseModel):
+-    payload: Dict[str, Any]
+ 
+-@app.post("/enactments/{enactment_id}/send/{message_name}")
+-async def send_message(enactment_id: str, message_name: str, body: dict, background_tasks: BackgroundTasks, role: Optional[str] = None):
+-    if enactment_id not in enactments: raise HTTPException(404, "Enactment not found")
+-    record = enactments[enactment_id]
+-    protocol_name = record["protocol"]
+-    role_name = str(role if role else record.get("role", AGENT_NAME))
+-    
+-    adapter = await ensure_adapter(protocol_name, role_name)
+-    bindings = record["bindings"]
++# ─────────────────────────────────────────────────────────────────
++# Send a message
++# ─────────────────────────────────────────────────────────────────
++@app.post("/{agent_id}/enactments/{enactment_id}/send/{message_name}")
++async def send_message(
++    agent_id:     str,
++    enactment_id: str,
++    message_name: str,
++    request:      Request,
++    background_tasks: BackgroundTasks,
++    mas_id:       str = Query(...),
++):
++    if agent_id != AGENT_ID:
++        raise HTTPException(404, "Unknown agent")
++    if mas_id not in active_agents:
++        raise HTTPException(404, f"Not joined MAS '{mas_id}'")
++
++    slot = active_agents[mas_id]
++    adapter    = slot["adapter"]
++    enactments = slot["enactments"]
++    topology   = slot["config"]["topology"]
+ 
+-    schema = next((getattr(m, "schema", m) for m in adapter.enabled_messages.messages() if getattr(m, "schema", m).name == message_name), None)
+-    if not schema: raise HTTPException(400, f"Message {message_name} not enabled or already sent")
++    if enactment_id not in enactments:
++        raise HTTPException(404, "Enactment not found")
+ 
++    record   = enactments[enactment_id]
++    bindings = record["bindings"]
++
++    body        = await request.json()
+     req_payload = body.get("payload", {})
+ 
+-    # 1. Inject Enactment ID for missing keys
+-    for ref in safe_list(getattr(schema, 'outs', [])):
+-        p = ref.param if hasattr(ref, 'param') else ref
+-        ref_name = str(getattr(p, 'name', ref))
+-        is_key = bool(getattr(p, 'key', False) or getattr(p, 'is_key', False) or 'key' in str(p).lower().split())
+-        
+-        if is_key and ref_name not in req_payload and ref_name not in bindings:
+-            req_payload[ref_name] = enactment_id
++    # Find schema in enabled messages
++    schema = next(
++        (getattr(m, "schema", m) for m in adapter.enabled_messages.messages()
++         if getattr(m, "schema", m).name == message_name),
++        None,
++    )
++    if schema is None:
++        raise HTTPException(400, f"Message '{message_name}' is not currently enabled")
++
++    proto = None
++    try:
++        proto, _ = load_protocol(slot["config"]["protocol_name"])
++    except Exception:
++        pass
++
++    # Auto-inject key parameters (use enactment_id as value if not supplied)
++    for ref in safe_list(getattr(schema, "outs", [])):
++        p       = ref.param if hasattr(ref, "param") else ref
++        p_name  = str(getattr(p, "name", ref)).strip()
++        is_key  = False
++        if proto and hasattr(proto, "public_parameters"):
++            param_obj = proto.public_parameters.get(p_name)
++            is_key = (param_obj and getattr(param_obj, "key", None) == "key")
++        if is_key and p_name not in req_payload and p_name not in bindings:
++            req_payload[p_name] = enactment_id
+ 
+     final_payload = {**bindings, **req_payload}
+ 
+-    # --- PRIVACY ENFORCEMENT FILTER ---
+-    # Deduce the exact parameters permitted by the BSPL schema
+-    valid_schema_params = set()
+-    for p in safe_list(getattr(schema, 'ins', [])) + safe_list(getattr(schema, 'outs', [])):
+-        param_obj = p.param if hasattr(p, 'param') else p
+-        valid_schema_params.add(str(getattr(param_obj, 'name', param_obj)).strip())
++    # Privacy filter — only params the schema permits
++    valid_params: set = set()
++    for ref in safe_list(getattr(schema, "ins", [])) + safe_list(getattr(schema, "outs", [])):
++        p = ref.param if hasattr(ref, "param") else ref
++        valid_params.add(str(getattr(p, "name", p)).strip())
++    filtered = {k: v for k, v in final_payload.items() if k in valid_params}
+ 
+-    # Isolate the payload to only transmit authorized knowledge
+-    filtered_payload = {k: v for k, v in final_payload.items() if k in valid_schema_params}
+-    to_send = []
++    # Build messages to send
++    to_send: List[Message] = []
+     recipients = safe_list(schema.recipients)
+-    
+-    # 2. Universal Deterministic Routing Matrix
+-    # 2. Universal Deterministic Routing Matrix (Pure Environment Variable Parsing)
+     if not recipients:
+-        to_send.append(Message(schema, filtered_payload, meta={"enactment": enactment_id}, adapter=adapter, system="default"))
++        to_send.append(Message(schema, filtered, meta={"enactment": enactment_id}, adapter=adapter, system="default"))
+     else:
+         for recip_role in recipients:
+-            r_name = str(getattr(recip_role, 'name', recip_role)).strip()
+-            
+-            # Pure dynamic parsing from the environment injected by the Launcher
+-            base_str = os.getenv("BASE_URLS", "")
+-            dynamic_urls = {}
+-            for pair in base_str.split(","):
+-                if "=" in pair:
+-                    k, v = pair.split("=", 1)
+-                    parsed = urlparse(v.strip())
+-                    dynamic_urls[k.strip()] = (parsed.hostname or "127.0.0.1", parsed.port or 80)
+-            
+-            if r_name in dynamic_urls:
+-                dest_url = dynamic_urls[r_name]
++            r_name = str(getattr(recip_role, "name", recip_role)).strip()
++            if r_name in topology:
++                parsed = urlparse(topology[r_name])
++                dest   = (parsed.hostname or "127.0.0.1", parsed.port or 80)
+             else:
+-                # If strictly not found in environment topology, fallback to self (Receiver Port)
+-                dest_url = ("127.0.0.1", RECEIVER_PORT)
+-                
+-            to_send.append(Message(schema, filtered_payload, meta={"enactment": enactment_id}, dest=dest_url, adapter=adapter, system="default"))
++                dest = ("127.0.0.1", API_PORT)
++            to_send.append(Message(schema, filtered, meta={"enactment": enactment_id}, dest=dest, adapter=adapter, system="default"))
+ 
+     try:
+-        new_messages, retry_messages = [], []
+-        for m in to_send:
+-            if adapter.history.context(m).find(m.schema): retry_messages.append(m)
+-            else: new_messages.append(m)
+-
+-        if new_messages:
+-            await adapter.send(*new_messages)
+-            record["bindings"].update(final_payload)
++        new_msgs   = [m for m in to_send if not adapter.history.context(m).find(m.schema)]
++        retry_msgs = [m for m in to_send if     adapter.history.context(m).find(m.schema)]
++
++        if new_msgs:
++            await adapter.send(*new_msgs)
++            record["bindings"].update(filtered)
+             background_tasks.add_task(StateManager.save)
+ 
+-        for m in retry_messages: await adapter.emitter.send(m)
+-        return {"status": "sent", "payload": final_payload}
++        for m in retry_msgs:
++            await adapter.emitter.send(m)
++
++        return {"status": "sent", "payload": filtered}
+     except Exception as e:
+-        raise HTTPException(400, f"System Error: {str(e)}")
+-    
++        raise HTTPException(400, f"Send failed: {e}")
++
++
++# ─────────────────────────────────────────────────────────────────
++# Knowledge base — full history grouped by enactment key
++# ─────────────────────────────────────────────────────────────────
++@app.get("/{agent_id}/knowledge_base")
++def get_knowledge_base(agent_id: str):
++    if agent_id != AGENT_ID:
++        raise HTTPException(404, "Unknown agent")
++
++    result: Dict[str, dict] = {}
++    for mas_id, slot in active_agents.items():
++        adapter    = slot["adapter"]
++        proto_name = slot["config"]["protocol_name"]
++        try:
++            proto, _ = load_protocol(proto_name)
++        except Exception:
++            continue
++
++        # Collect key parameter names from the protocol
++        key_params: set = set()
++        if hasattr(proto, "public_parameters"):
++            for p_name, param_obj in proto.public_parameters.items():
++                if getattr(param_obj, "key", None) == "key":
++                    key_params.add(p_name.strip())
++
++        # Group history by enactment key value
++        groups: Dict[str, list] = {}
++        for m in adapter.history.messages():
++            raw = {str(getattr(k, "name", k)).strip(): v for k, v in (getattr(m, "payload", {}) or {}).items()}
++            key_val = next((raw[kp] for kp in key_params if kp in raw), "unkeyed")
++            groups.setdefault(key_val, []).append({
++                "message": getattr(getattr(m, "schema", None), "name", "?"),
++                "payload": raw,
++                "meta":    {k: str(v) for k, v in (getattr(m, "meta", {}) or {}).items()},
++            })
++
++        result[mas_id] = {
++            "protocol":   proto_name,
++            "role":       slot["config"]["role"],
++            "enactments": groups,
++            "key_params": list(key_params),
++        }
++
++    return {"agent_id": AGENT_ID, "knowledge_base": result}
++
++
++# ─────────────────────────────────────────────────────────────────
++# Entry point
++# ─────────────────────────────────────────────────────────────────
+ if __name__ == "__main__":
+     import uvicorn
+     uvicorn.run(app, host="0.0.0.0", port=API_PORT, reload=False)
+\ No newline at end of file
+diff --git a/dashboard.html b/dashboard.html
+index cf3d870..5af5f0a 100644
+--- a/dashboard.html
++++ b/dashboard.html
+@@ -1,250 +1,1055 @@
+ <!DOCTYPE html>
+ <html lang="en">
+ <head>
+-    <meta charset="UTF-8">
+-    <title>Sliq Agent Dashboard</title>
+-    <style>
+-        :root { --primary: #2563eb; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; --success: #10b981; }
+-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: var(--bg); color: var(--text); }
+-        .card { background: var(--card); padding: 24px; margin-bottom: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
+-        h1, h3, h4 { margin-top: 0; }
+-        .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+-        .col { display: flex; flex-direction: column; gap: 8px; }
+-        input, select, button { padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; width: 100%; box-sizing: border-box; }
+-        button { background: var(--primary); color: white; border: none; cursor: pointer; font-weight: 600; }
+-        button:hover { opacity: 0.9; }
+-        .header-bar { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; margin-bottom: 20px; }
+-        .status-badge { background: var(--success); color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+-        .badge { background: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 12px; margin-right: 5px; }
+-        .msg-box { border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 16px; background: #fafafa;}
+-        .msg-header { font-weight: bold; margin-bottom: 12px; font-size: 16px; color: var(--primary); }
+-        pre { background: #f1f5f9; padding: 10px; border-radius: 6px; font-size: 13px; overflow-x: auto; }
+-    </style>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>Sliq — BSPL Agent Node</title>
++  <link rel="preconnect" href="https://fonts.googleapis.com">
++  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
++  <style>
++    /* ── Design tokens ───────────────────────────────────────────── */
++    :root {
++      --bg:        #0f1117;
++      --surface:   #1a1d27;
++      --surface2:  #242736;
++      --border:    #2e3147;
++      --primary:   #7c8cff;
++      --primary-glow: rgba(124,140,255,.18);
++      --accent:    #63e2b7;
++      --accent2:   #ffb86c;
++      --danger:    #ff6b6b;
++      --text:      #e2e8f0;
++      --muted:     #7a8499;
++      --card-shadow: 0 4px 24px rgba(0,0,0,.4);
++    }
++
++    /* ── Reset & base ────────────────────────────────────────────── */
++    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
++    html { font-size: 15px; }
++    body {
++      font-family: 'Inter', sans-serif;
++      background: var(--bg);
++      color: var(--text);
++      min-height: 100vh;
++      display: flex;
++      flex-direction: column;
++    }
++    a { color: var(--primary); text-decoration: none; }
++
++    /* ── Scrollbar ───────────────────────────────────────────────── */
++    ::-webkit-scrollbar { width: 6px; height: 6px; }
++    ::-webkit-scrollbar-track { background: var(--bg); }
++    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
++
++    /* ── Layout helpers ──────────────────────────────────────────── */
++    .view  { display: none; flex-direction: column; flex: 1; animation: fadeIn .25s ease; }
++    .view.active { display: flex; }
++    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
++
++    .container { max-width: 960px; margin: 0 auto; width: 100%; padding: 24px 20px; }
++    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
++    .grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; }
++    @media (max-width: 680px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
++
++    /* ── Cards ───────────────────────────────────────────────────── */
++    .card {
++      background: var(--surface);
++      border: 1px solid var(--border);
++      border-radius: 14px;
++      padding: 22px;
++      box-shadow: var(--card-shadow);
++    }
++    .card-title {
++      font-size: .72rem;
++      font-weight: 600;
++      letter-spacing: .09em;
++      text-transform: uppercase;
++      color: var(--muted);
++      margin-bottom: 14px;
++    }
++
++    /* ── Top nav bar ─────────────────────────────────────────────── */
++    .topbar {
++      background: var(--surface);
++      border-bottom: 1px solid var(--border);
++      padding: 12px 24px;
++      display: flex;
++      align-items: center;
++      gap: 14px;
++    }
++    .topbar-logo {
++      font-size: 1.15rem;
++      font-weight: 700;
++      background: linear-gradient(135deg, var(--primary), var(--accent));
++      -webkit-background-clip: text;
++      -webkit-text-fill-color: transparent;
++      letter-spacing: -.02em;
++    }
++    .topbar-sep { flex: 1; }
++    .pill {
++      display: inline-flex;
++      align-items: center;
++      gap: 6px;
++      padding: 4px 12px;
++      border-radius: 20px;
++      font-size: .75rem;
++      font-weight: 600;
++    }
++    .pill-primary { background: var(--primary-glow); color: var(--primary); border: 1px solid var(--primary); }
++    .pill-green   { background: rgba(99,226,183,.12); color: var(--accent);  border: 1px solid var(--accent); }
++    .pill-orange  { background: rgba(255,184,108,.12); color: var(--accent2); border: 1px solid var(--accent2); }
++    .pill-red     { background: rgba(255,107,107,.12); color: var(--danger);  border: 1px solid var(--danger); }
++
++    /* ── Typography ──────────────────────────────────────────────── */
++    h1 { font-size: 1.7rem; font-weight: 700; letter-spacing: -.03em; }
++    h2 { font-size: 1.2rem; font-weight: 600; }
++    h3 { font-size: .92rem; font-weight: 600; margin-bottom: 10px; }
++    p.sub { color: var(--muted); font-size: .85rem; margin-top: 5px; line-height: 1.55; }
++
++    /* ── Form controls ───────────────────────────────────────────── */
++    label.field-label {
++      display: block;
++      font-size: .75rem;
++      font-weight: 600;
++      color: var(--muted);
++      text-transform: uppercase;
++      letter-spacing: .06em;
++      margin-bottom: 6px;
++    }
++    input, select {
++      width: 100%;
++      padding: 10px 13px;
++      background: var(--surface2);
++      border: 1px solid var(--border);
++      border-radius: 8px;
++      color: var(--text);
++      font-family: 'Inter', sans-serif;
++      font-size: .88rem;
++      outline: none;
++      transition: border-color .2s;
++    }
++    input:focus, select:focus { border-color: var(--primary); }
++    select option { background: var(--surface2); }
++    .form-group { margin-bottom: 14px; }
++
++    /* ── Buttons ──────────────────────────────────────────────────── */
++    .btn {
++      display: inline-flex;
++      align-items: center;
++      justify-content: center;
++      gap: 7px;
++      padding: 10px 20px;
++      border-radius: 8px;
++      font-size: .88rem;
++      font-weight: 600;
++      cursor: pointer;
++      border: none;
++      transition: opacity .18s, transform .12s;
++    }
++    .btn:hover { opacity: .88; transform: translateY(-1px); }
++    .btn:active { transform: translateY(0); }
++    .btn-primary { background: var(--primary); color: #fff; }
++    .btn-accent  { background: var(--accent);  color: #0f1117; }
++    .btn-ghost   { background: transparent; color: var(--muted); border: 1px solid var(--border); }
++    .btn-danger  { background: var(--danger);  color: #fff; }
++    .btn-sm { padding: 7px 14px; font-size: .8rem; }
++    .btn-full { width: 100%; margin-top: 6px; }
++
++    /* ── Protocol card (View 1 grid) ─────────────────────────────── */
++    .proto-card {
++      background: var(--surface);
++      border: 1px solid var(--border);
++      border-radius: 12px;
++      padding: 18px 20px;
++      cursor: pointer;
++      transition: border-color .2s, box-shadow .2s;
++    }
++    .proto-card:hover { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-glow); }
++    .proto-card h3 { color: var(--primary); margin-bottom: 4px; }
++    .proto-card .sub { font-size: .8rem; }
++
++    /* ── Session tiles ────────────────────────────────────────────── */
++    .session-tile {
++      background: var(--surface2);
++      border: 1px solid var(--border);
++      border-radius: 10px;
++      padding: 14px 16px;
++      display: flex;
++      align-items: center;
++      justify-content: space-between;
++      gap: 10px;
++    }
++    .session-tile .role-badge {
++      font-family: 'JetBrains Mono', monospace;
++      font-size: .72rem;
++      background: var(--primary-glow);
++      color: var(--primary);
++      padding: 2px 8px;
++      border-radius: 20px;
++    }
++
++    /* ── Protocol inspector table ────────────────────────────────── */
++    .msg-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
++    .msg-table th {
++      text-align: left;
++      font-size: .7rem;
++      font-weight: 600;
++      text-transform: uppercase;
++      letter-spacing: .07em;
++      color: var(--muted);
++      padding: 6px 10px;
++      border-bottom: 1px solid var(--border);
++    }
++    .msg-table td {
++      padding: 9px 10px;
++      font-size: .83rem;
++      border-bottom: 1px solid var(--border);
++      vertical-align: top;
++    }
++    .msg-table tr:last-child td { border-bottom: none; }
++    .msg-table tr:hover td { background: var(--surface2); }
++    .param-tag {
++      display: inline-block;
++      font-family: 'JetBrains Mono', monospace;
++      font-size: .68rem;
++      padding: 2px 7px;
++      border-radius: 4px;
++      margin: 2px 2px 2px 0;
++    }
++    .tag-out  { background: rgba(124,140,255,.15); color: var(--primary); border: 1px solid rgba(124,140,255,.3); }
++    .tag-in   { background: rgba(99,226,183,.12);  color: var(--accent);  border: 1px solid rgba(99,226,183,.25); }
++    .tag-key  { background: rgba(255,184,108,.14); color: var(--accent2); border: 1px solid rgba(255,184,108,.3); }
++    .arrow { color: var(--muted); font-size: .8rem; white-space: nowrap; }
++
++    /* ── Topology builder ─────────────────────────────────────────── */
++    .topology-row {
++      display: grid;
++      grid-template-columns: 120px 1fr;
++      gap: 8px;
++      margin-bottom: 8px;
++      align-items: center;
++    }
++    .topology-role {
++      font-family: 'JetBrains Mono', monospace;
++      font-size: .78rem;
++      color: var(--primary);
++      background: var(--primary-glow);
++      border: 1px solid rgba(124,140,255,.3);
++      border-radius: 6px;
++      padding: 6px 10px;
++      text-align: center;
++    }
++
++    /* ── Action boxes ─────────────────────────────────────────────── */
++    .action-box {
++      background: var(--surface2);
++      border: 1px solid var(--border);
++      border-radius: 10px;
++      padding: 16px;
++      margin-bottom: 12px;
++      animation: slideIn .2s ease;
++    }
++    @keyframes slideIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; } }
++    .action-title {
++      font-size: .92rem;
++      font-weight: 600;
++      color: var(--primary);
++      margin-bottom: 12px;
++      display: flex;
++      align-items: center;
++      gap: 8px;
++    }
++    .action-arrow { color: var(--muted); font-size: .75rem; }
++    .param-row {
++      display: flex;
++      align-items: center;
++      gap: 10px;
++      margin-bottom: 9px;
++    }
++    .param-row .param-tag { flex-shrink: 0; }
++    .param-row input { flex: 1; }
++    .param-key-note {
++      font-size: .76rem;
++      color: var(--accent2);
++      font-style: italic;
++      margin-left: 4px;
++    }
++
++    /* ── Knowledge base ───────────────────────────────────────────── */
++    .kb-group {
++      background: var(--surface2);
++      border: 1px solid var(--border);
++      border-radius: 10px;
++      margin-bottom: 12px;
++      overflow: hidden;
++    }
++    .kb-group-header {
++      padding: 10px 14px;
++      font-size: .78rem;
++      font-weight: 600;
++      color: var(--accent2);
++      background: rgba(255,184,108,.06);
++      border-bottom: 1px solid var(--border);
++      font-family: 'JetBrains Mono', monospace;
++    }
++    .kb-msg-row {
++      display: grid;
++      grid-template-columns: 140px 1fr;
++      gap: 10px;
++      padding: 9px 14px;
++      border-bottom: 1px solid var(--border);
++      font-size: .8rem;
++    }
++    .kb-msg-row:last-child { border-bottom: none; }
++    .kb-msg-name { font-weight: 600; color: var(--primary); font-family: 'JetBrains Mono', monospace; }
++    .kb-payload  { color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: .73rem; }
++
++    /* ── Divider ──────────────────────────────────────────────────── */
++    .divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
++
++    /* ── Info chip ────────────────────────────────────────────────── */
++    .info-chip {
++      display: inline-flex; align-items: center; gap: 6px;
++      background: var(--surface2); border: 1px solid var(--border);
++      border-radius: 8px; padding: 6px 12px; font-size: .78rem; color: var(--muted);
++    }
++    .info-chip strong { color: var(--text); font-weight: 500; }
++
++    /* ── Empty state ──────────────────────────────────────────────── */
++    .empty {
++      text-align: center; padding: 32px 20px;
++      color: var(--muted); font-size: .85rem;
++    }
++
++    /* ── Fade-in spinner ──────────────────────────────────────────── */
++    .spinner {
++      width: 18px; height: 18px;
++      border: 2px solid var(--border);
++      border-top-color: var(--primary);
++      border-radius: 50%;
++      animation: spin .6s linear infinite;
++      display: inline-block;
++    }
++    @keyframes spin { to { transform: rotate(360deg); } }
++
++    /* ── Toast notifications ─────────────────────────────────────── */
++    #toast {
++      position: fixed; bottom: 22px; right: 22px;
++      background: var(--surface); border: 1px solid var(--border);
++      border-radius: 10px; padding: 12px 18px;
++      font-size: .83rem; max-width: 320px; z-index: 9999;
++      box-shadow: var(--card-shadow);
++      transition: opacity .3s;
++      display: none;
++    }
++  </style>
+ </head>
+ <body>
+-    <div class="header-bar">
+-        <div>
+-            <h1>Sliq Dashboard</h1>
+-            <p style="margin:0; color:#64748b;">Node: <strong id="agentIdentityDisplay">Loading...</strong></p>
++
++<!-- ── Top bar ───────────────────────────────────────────────────── -->
++<div class="topbar">
++  <span class="topbar-logo">Sliq</span>
++  <span id="navNodeName" style="font-size:.82rem;color:var(--muted);">Node</span>
++  <span class="topbar-sep"></span>
++  <span id="navStatus" class="pill pill-red">⬤ Connecting…</span>
++</div>
++
++<!-- ════════════════════════════════════════════════════════════════ -->
++<!-- VIEW 1 — Node Home                                              -->
++<!-- ════════════════════════════════════════════════════════════════ -->
++<div id="viewHome" class="view">
++  <div class="container">
++
++    <!-- Identity banner -->
++    <div style="margin-bottom:28px; display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:14px;">
++      <div>
++        <h1 id="homeAgentName">Agent Node</h1>
++        <p class="sub" style="margin-top:8px;">
++          UUID: <code id="homeAgentId" style="font-family:'JetBrains Mono',monospace;font-size:.8rem;color:var(--muted);"></code>
++        </p>
++        <p class="sub">Webhook base: <code id="homeWebhook" style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--primary);"></code></p>
++      </div>
++      <span id="homeConnPill" class="pill pill-red">⬤ API Offline</span>
++    </div>
++
++    <div class="grid-2">
++
++      <!-- Active sessions -->
++      <div>
++        <div class="card-title">Active MAS Sessions</div>
++        <div id="homeSessions">
++          <div class="empty">No active sessions yet</div>
+         </div>
+-        <div id="connectionStatus" class="status-badge" style="background: #ef4444;">Connecting...</div>
++      </div>
++
++      <!-- Available protocols -->
++      <div>
++        <div class="card-title">Available Protocols — click to inspect</div>
++        <div id="homeProtocols">
++          <div class="empty"><span class="spinner"></span></div>
++        </div>
++      </div>
++
+     </div>
++  </div>
++</div>
++
++<!-- ════════════════════════════════════════════════════════════════ -->
++<!-- VIEW 2 — Protocol Inspector                                     -->
++<!-- ════════════════════════════════════════════════════════════════ -->
++<div id="viewInspector" class="view">
++  <div class="container">
+ 
+-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+-        <div class="col">
+-            <div class="card">
+-                <h3>Join Protocol Enactment</h3>
+-                <p style="font-size: 13px; color: #64748b;">Connect this agent to a shared multi-party session.</p>
+-                <div class="col">
+-                    <label style="font-size: 12px; font-weight: bold;">Protocol:</label>
+-                    <select id="protocolSelect" onchange="fetchRoles()">
+-                        <option value="">-- Select Protocol --</option>
+-                        <option value="Logistics">Logistics</option>
+-                        <option value="Purchase">Purchase</option>
+-                    </select>
+-
+-                    <label style="font-size: 12px; font-weight: bold; margin-top: 5px;">Agent Role:</label>
+-                    <select id="roleSelect" disabled>
+-                        <option value="">-- Select Protocol First --</option>
+-                    </select>
+-
+-                    <label style="font-size: 12px; font-weight: bold; margin-top: 5px;">Enactment ID (Shared Key):</label>
+-                    <input type="text" id="enactmentId" placeholder="e.g., demo-1">
+-                    
+-                    <button onclick="startEnactment()" style="margin-top: 10px;">Connect & Listen</button>
+-                </div>
+-            </div>
+-            
+-            <div class="card">
+-                <h3>System Status</h3>
+-                <p style="font-size: 13px; color: #64748b;">Current Active Enactment: <strong id="activeEnactmentLabel">None</strong></p>
+-                <button onclick="fetchActions()" style="background: #64748b;">Refresh State Manually</button>
+-            </div>
++    <div style="display:flex; align-items:center; gap:14px; margin-bottom:24px; flex-wrap:wrap;">
++      <button class="btn btn-ghost btn-sm" onclick="showView('viewHome')">← Back</button>
++      <h2 id="inspectorTitle">Protocol Inspector</h2>
++    </div>
++
++    <div class="card" style="margin-bottom:20px;">
++      <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px;" id="inspectorRoles"></div>
++
++      <div class="card-title">Message Flow</div>
++      <table class="msg-table">
++        <thead>
++          <tr>
++            <th>Message</th>
++            <th>Sender → Recipient(s)</th>
++            <th>Outputs (out)</th>
++            <th>Inputs (in)</th>
++          </tr>
++        </thead>
++        <tbody id="inspectorMsgs"></tbody>
++      </table>
++    </div>
++
++    <div style="display:flex; gap:12px; flex-wrap:wrap;">
++      <button class="btn btn-primary" id="inspectorJoinBtn">Join this MAS →</button>
++      <button class="btn btn-ghost" onclick="showView('viewHome')">Back to Node Home</button>
++    </div>
++  </div>
++</div>
++
++<!-- ════════════════════════════════════════════════════════════════ -->
++<!-- VIEW 3 — Join MAS Form                                          -->
++<!-- ════════════════════════════════════════════════════════════════ -->
++<div id="viewJoin" class="view">
++  <div class="container">
++
++    <div style="display:flex; align-items:center; gap:14px; margin-bottom:24px;">
++      <button class="btn btn-ghost btn-sm" id="joinBackBtn">← Back</button>
++      <h2 id="joinTitle">Join MAS</h2>
++    </div>
++
++    <div class="grid-2">
++      <div class="card">
++        <h3>Session Details</h3>
++        <div class="form-group">
++          <label class="field-label">MAS ID <span style="color:var(--danger)">*</span></label>
++          <input type="text" id="joinMasId" placeholder="e.g. trading-session-1">
++        </div>
++        <div class="form-group">
++          <label class="field-label">Enactment ID (optional)</label>
++          <input type="text" id="joinEnactmentId" placeholder="Leave blank to generate">
++        </div>
++        <div class="form-group">
++          <label class="field-label">Your Role <span style="color:var(--danger)">*</span></label>
++          <select id="joinRole" onchange="rebuildTopology()">
++            <option value="">— Select Role —</option>
++          </select>
+         </div>
++      </div>
+ 
+-        <div>
+-            <div class="card" id="interactionPanel" style="display: none;">
+-                <h3>Protocol Execution</h3>
+-                
+-                <h4>Known Information</h4>
+-                <pre id="knowledgeDisplay">{}</pre>
++      <div class="card">
++        <h3>Peer Topology</h3>
++        <p class="sub" style="margin-bottom:14px;">For each other role, provide their node base URL
++          (e.g. <code style="font-family:'JetBrains Mono',monospace;">http://127.0.0.1:8002/{their_uuid}</code>)
++        </p>
++        <div id="topologyBuilder"></div>
++      </div>
++    </div>
++
++    <div style="margin-top:16px; display:flex; gap:12px; flex-wrap:wrap;">
++      <button class="btn btn-accent" onclick="submitJoin()">Join MAS</button>
++      <button class="btn btn-ghost" onclick="showView('viewInspector')">← Back</button>
++    </div>
+ 
+-                <h4>Available Actions</h4>
+-                <div id="actionsContainer"></div>
+-            </div>
++    <div id="joinError" style="margin-top:14px; color:var(--danger); font-size:.83rem; display:none;"></div>
++  </div>
++</div>
++
++<!-- ════════════════════════════════════════════════════════════════ -->
++<!-- VIEW 4 — Agent Dashboard                                        -->
++<!-- ════════════════════════════════════════════════════════════════ -->
++<div id="viewDashboard" class="view">
++  <div class="container">
++
++    <!-- Dashboard header -->
++    <div style="display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:14px; margin-bottom:24px;">
++      <div>
++        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
++          <button class="btn btn-ghost btn-sm" onclick="showView('viewHome')">← Node Home</button>
++          <span id="dashRolePill" class="pill pill-primary"></span>
++          <span id="dashMasPill" class="pill pill-orange"></span>
+         </div>
++        <h1 id="dashAgentName">Dashboard</h1>
++        <p class="sub" id="dashSubtitle"></p>
++      </div>
++      <span id="dashConnPill" class="pill pill-green">⬤ Connected</span>
+     </div>
+ 
+-    <script>
+-        const BASE_URL = window.location.origin;
+-        let currentEnactmentId = null;
+-        let lastActionsHash = ""; // Tracks UI state to prevent flickering
+-
+-        window.onload = async () => {
+-            try {
+-                const res = await fetch(`${BASE_URL}/vcard`);
+-                if (res.ok) {
+-                    const data = await res.json();
+-                    document.getElementById('agentIdentityDisplay').innerText = data.agent;
+-                    document.getElementById('connectionStatus').innerText = "Connected";
+-                    document.getElementById('connectionStatus').style.background = "var(--success)";
+-                }
+-            } catch (e) {
+-                document.getElementById('agentIdentityDisplay').innerText = "API Offline";
+-            }
+-        };
+-
+-        async function fetchRoles() {
+-            const protocol = document.getElementById('protocolSelect').value;
+-            const roleSelect = document.getElementById('roleSelect');
+-            
+-            if (!protocol) {
+-                roleSelect.innerHTML = '<option value="">-- Select Protocol First --</option>';
+-                roleSelect.disabled = true;
+-                return;
+-            }
+-
+-            try {
+-                const res = await fetch(`${BASE_URL}/protocols/${protocol}`);
+-                const data = await res.json();
+-                roleSelect.innerHTML = '';
+-                data.roles.forEach(role => {
+-                    const opt = document.createElement('option');
+-                    opt.value = role;
+-                    opt.innerText = role;
+-                    roleSelect.appendChild(opt);
+-                });
+-                roleSelect.disabled = false;
+-                
+-                // Auto-select if agent name exactly matches a protocol role
+-                const agentName = document.getElementById('agentIdentityDisplay').innerText;
+-                if (data.roles.includes(agentName)) {
+-                    roleSelect.value = agentName;
+-                }
+-            } catch (e) { console.error("Failed to load roles", e); }
+-        }
++    <div class="grid-2" style="margin-bottom:20px;">
++      <!-- Start enactment -->
++      <div class="card">
++        <h3>Start / Join Enactment</h3>
++        <div class="form-group">
++          <label class="field-label">Enactment ID</label>
++          <input type="text" id="dashEnactmentId" placeholder="Shared key or leave blank for new UUID">
++        </div>
++        <button class="btn btn-primary btn-full" onclick="startEnactment()">Start Enactment</button>
++      </div>
+ 
+-        async function startEnactment() {
+-            const protocol = document.getElementById('protocolSelect').value;
+-            const role = document.getElementById('roleSelect').value;
+-            const enactmentId = document.getElementById('enactmentId').value.trim();
+-
+-            if (!protocol || !role || !enactmentId) { 
+-                alert("Please fill in Protocol, Role, and Enactment ID."); 
+-                return; 
+-            }
+-
+-            const res = await fetch(`${BASE_URL}/protocols/${protocol}/enactments?role=${role}&enactment_id=${enactmentId}`, {
+-                method: 'POST',
+-                headers: {'Content-Type': 'application/json'},
+-                body: JSON.stringify({ bindings: {} })
+-            });
+-
+-            if (res.ok) {
+-                currentEnactmentId = enactmentId;
+-                lastActionsHash = ""; // Reset diff hash on new enactment
+-                document.getElementById('activeEnactmentLabel').innerText = enactmentId;
+-                document.getElementById('interactionPanel').style.display = 'block';
+-                fetchActions();
+-            } else {
+-                alert("Failed to join enactment");
+-            }
+-        }
++      <!-- Active enactment selector -->
++      <div class="card">
++        <h3>Active Enactments</h3>
++        <div class="form-group">
++          <label class="field-label">Select Enactment</label>
++          <select id="dashEnactmentSelect" onchange="onEnactmentSelected()">
++            <option value="">— None selected —</option>
++          </select>
++        </div>
++        <div id="dashCurrentEnactment" style="font-size:.78rem; color:var(--muted);">No active enactment selected</div>
++      </div>
++    </div>
+ 
+-        async function fetchActions() {
+-            if (!currentEnactmentId) return;
+-            try {
+-                const res = await fetch(`${BASE_URL}/enactments/${currentEnactmentId}/actions`);
+-                const data = await res.json();
+-                
+-                // 1. ALWAYS update the Known Information text block
+-                document.getElementById('knowledgeDisplay').innerText = JSON.stringify(data.bindings, null, 2);
+-                
+-                // 2. CHECK if the actual actions array has structurally changed
+-                const newActionsHash = JSON.stringify(data.actions);
+-                if (newActionsHash === lastActionsHash) {
+-                    return; // Exit early! Prevents HTML redraw and saves your typing
+-                }
+-                lastActionsHash = newActionsHash; 
+-
+-                // 3. Redraw the forms ONLY if actions changed
+-                const container = document.getElementById('actionsContainer');
+-                container.innerHTML = '';
+-
+-                if (data.actions.length === 0) {
+-                    container.innerHTML = '<p style="color:#64748b; font-style:italic;">No actions currently enabled. Waiting for peers...</p>';
+-                }
+-
+-                data.actions.forEach(action => {
+-                    const msgDiv = document.createElement('div');
+-                    msgDiv.className = 'msg-box';
+-                    msgDiv.id = `msg-box-${action.message}`;
+-                    
+-                    let html = `<div class="msg-header">${action.message}</div><div class="col">`;
+-                    
+-                    action.outs.forEach(outItem => {
+-                        const outParam = outItem.name || outItem; 
+-                        const isKey = outItem.is_key || false;
+-
+-                        if (isKey) {
+-                            html += `<div style="display:flex; align-items:center; gap: 10px; opacity: 0.7;">
+-                                <span class="badge" style="background:var(--success); color:white;">AUTO KEY</span> 
+-                                <span style="min-width:70px; font-size:13px; font-weight:600;">${outParam}</span>
+-                                <span style="font-size: 12px; color: #64748b; font-style: italic;">System managed</span>
+-                            </div>`;
+-                        } else {
+-                            html += `<div style="display:flex; align-items:center; gap: 10px;">
+-                                <span class="badge">OUT</span> 
+-                                <span style="min-width:70px; font-size:13px; font-weight:600;">${outParam}</span>
+-                                <input type="text" data-param="${outParam}" placeholder="Value for ${outParam}">
+-                            </div>`;
+-                        }
+-                    });
+-
+-                    html += `<button onclick="send('${action.message}')" style="margin-top:10px;">Send ${action.message}</button></div>`;
+-                    msgDiv.innerHTML = html;
+-                    container.appendChild(msgDiv);
+-                });
+-
+-            } catch (e) { console.error("Failed to fetch actions", e); }
+-        }
++    <!-- Protocol Execution + Knowledge Base -->
++    <div class="grid-2">
++
++      <!-- Left: Execution panel -->
++      <div>
++        <div class="card-title">Protocol Execution</div>
++
++        <!-- Known bindings -->
++        <div class="card" style="margin-bottom:16px;">
++          <div class="card-title">Known Information</div>
++          <div id="dashBindings">
++            <div class="empty" style="padding:12px;">No enactment selected</div>
++          </div>
++        </div>
++
++        <!-- Enabled actions -->
++        <div class="card-title">Available Actions</div>
++        <div id="dashActions">
++          <div class="empty">Select an enactment to see enabled actions</div>
++        </div>
++      </div>
++
++      <!-- Right: Knowledge base -->
++      <div>
++        <div class="card-title">
++          Knowledge Base
++          <span style="font-weight:400; text-transform:none; letter-spacing:0; margin-left:6px;">— all enactments history</span>
++        </div>
++        <div id="dashKB">
++          <div class="empty">Loading…</div>
++        </div>
++      </div>
++    </div>
++
++  </div>
++</div>
++
++<!-- Toast -->
++<div id="toast"></div>
++
++<!-- ════════════════════════════════════════════════════════════════ -->
++<!-- JavaScript                                                       -->
++<!-- ════════════════════════════════════════════════════════════════ -->
++<script>
++  const BASE = window.location.origin;
++
++  // ── State ────────────────────────────────────────────────────────
++  let agentId    = null;
++  let agentName  = null;
++  let currentProtocol  = null;  // { name, roles, messages }
++  let currentMasId     = null;
++  let currentEnactmentId = null;
++  let lastActionsHash  = '';
++  let lastKBHash       = '';
++  let pollTimer        = null;
++
++  // ── Toast ─────────────────────────────────────────────────────────
++  function toast(msg, type = 'info') {
++    const el = document.getElementById('toast');
++    el.textContent = msg;
++    el.style.display = 'block';
++    el.style.opacity = '1';
++    el.style.borderColor = type === 'error' ? 'var(--danger)' : type === 'ok' ? 'var(--accent)' : 'var(--border)';
++    clearTimeout(el._timer);
++    el._timer = setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.style.display = 'none', 300); }, 3200);
++  }
++
++  // ── View router ───────────────────────────────────────────────────
++  function showView(id) {
++    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
++    document.getElementById(id).classList.add('active');
++  }
++
++  function routeByPath() {
++    const path = window.location.pathname;
++    const dashMatch = path.match(/^\/([^/]+)\/dashboard$/);
++    if (dashMatch) {
++      const uid = dashMatch[1];
++      if (uid === agentId) {
++        openDashboard();
++        return;
++      }
++    }
++    showView('viewHome');
++  }
++
++  // ── Boot ──────────────────────────────────────────────────────────
++  window.onload = async () => {
++    try {
++      const res  = await fetch(`${BASE}/api/identity`);
++      const id   = await res.json();
++      agentId    = id.agent_id;
++      agentName  = id.agent_name;
++
++      document.getElementById('homeAgentName').textContent = agentName || 'Unnamed Node';
++      document.getElementById('homeAgentId').textContent   = agentId;
++      document.getElementById('homeWebhook').textContent   = id.webhook_base;
++      document.getElementById('navNodeName').textContent   = agentName || 'Node';
++      document.getElementById('navStatus').textContent     = '⬤ Connected';
++      document.getElementById('navStatus').className       = 'pill pill-green';
++      document.getElementById('homeConnPill').textContent  = '⬤ Online';
++      document.getElementById('homeConnPill').className    = 'pill pill-green';
++    } catch {
++      document.getElementById('navStatus').textContent = '⬤ Offline';
++    }
++
++    loadProtocols();
++    loadSessions();
++    routeByPath();
++  };
++
++  // ── Node Home helpers ─────────────────────────────────────────────
++  async function loadProtocols() {
++    const wrap = document.getElementById('homeProtocols');
++    try {
++      const res  = await fetch(`${BASE}/protocols`);
++      const data = await res.json();
++      if (!data.protocols.length) { wrap.innerHTML = '<div class="empty">No .bspl files found</div>'; return; }
++      wrap.innerHTML = '';
++      data.protocols.forEach(name => {
++        const el = document.createElement('div');
++        el.className = 'proto-card';
++        el.innerHTML = `<h3>${name}</h3><p class="sub">Click to view protocol specification</p>`;
++        el.onclick = () => openInspector(name);
++        wrap.appendChild(el);
++      });
++    } catch { wrap.innerHTML = '<div class="empty">Failed to load protocols</div>'; }
++  }
++
++  async function loadSessions() {
++    const wrap = document.getElementById('homeSessions');
++    try {
++      const res  = await fetch(`${BASE}/api/agents`);
++      const data = await res.json();
++      if (!data.mas_sessions.length) { wrap.innerHTML = '<div class="empty">No active sessions yet</div>'; return; }
++      wrap.innerHTML = '';
++      data.mas_sessions.forEach(s => {
++        const el = document.createElement('div');
++        el.className = 'session-tile';
++        el.style.marginBottom = '10px';
++        el.innerHTML = `
++          <div>
++            <div style="font-weight:600;margin-bottom:4px;">${s.mas_id}</div>
++            <div style="font-size:.75rem;color:var(--muted);">${s.protocol} · ${s.enactment_ids.length} enactment(s)</div>
++          </div>
++          <div style="display:flex;gap:8px;align-items:center;">
++            <span class="role-badge">${s.role}</span>
++            <button class="btn btn-primary btn-sm" onclick="goToDashboard('${s.mas_id}','${s.role}','${s.protocol}')">Open →</button>
++          </div>`;
++        wrap.appendChild(el);
++      });
++    } catch { wrap.innerHTML = '<div class="empty">Failed to load sessions</div>'; }
++  }
++
++  // ── Protocol Inspector ─────────────────────────────────────────────
++  async function openInspector(protocolName) {
++    try {
++      const res  = await fetch(`${BASE}/protocols/${protocolName}`);
++      currentProtocol = await res.json();
++    } catch { toast('Failed to load protocol spec', 'error'); return; }
++
++    document.getElementById('inspectorTitle').textContent = `Protocol: ${currentProtocol.name}`;
++
++    // Roles
++    const rolesWrap = document.getElementById('inspectorRoles');
++    rolesWrap.innerHTML = '<span style="font-size:.75rem;color:var(--muted);margin-right:6px;">Roles:</span>';
++    currentProtocol.roles.forEach(r => {
++      const s = document.createElement('span');
++      s.className = 'pill pill-primary';
++      s.textContent = r;
++      rolesWrap.appendChild(s);
++    });
++
++    // Messages table
++    const tbody = document.getElementById('inspectorMsgs');
++    tbody.innerHTML = '';
++    currentProtocol.messages.forEach(msg => {
++      const tr = document.createElement('tr');
++      const outsHtml  = msg.outs.map(p =>
++        p.key ? `<span class="param-tag tag-key">key: ${p.name}</span>`
++              : `<span class="param-tag tag-out">out: ${p.name}</span>`
++      ).join('');
++      const insHtml   = msg.ins.map(p => `<span class="param-tag tag-in">in: ${p.name}</span>`).join('');
++      tr.innerHTML = `
++        <td><strong style="color:var(--primary);font-family:'JetBrains Mono',monospace;">${msg.name}</strong></td>
++        <td class="arrow">${msg.sender} → ${msg.recipients.join(', ')}</td>
++        <td>${outsHtml || '<span style="color:var(--muted)">—</span>'}</td>
++        <td>${insHtml  || '<span style="color:var(--muted)">—</span>'}</td>`;
++      tbody.appendChild(tr);
++    });
++
++    document.getElementById('inspectorJoinBtn').onclick = () => openJoinForm(currentProtocol.name);
++    showView('viewInspector');
++  }
++
++  // ── Join MAS Form ─────────────────────────────────────────────────
++  function openJoinForm(protocolName) {
++    document.getElementById('joinTitle').textContent = `Join MAS — ${protocolName}`;
++    document.getElementById('joinError').style.display = 'none';
++
++    // Populate role dropdown
++    const sel = document.getElementById('joinRole');
++    sel.innerHTML = '<option value="">— Select Role —</option>';
++    if (currentProtocol) {
++      currentProtocol.roles.forEach(r => {
++        const o = document.createElement('option');
++        o.value = r; o.textContent = r;
++        sel.appendChild(o);
++      });
++    }
++
++    document.getElementById('joinBackBtn').onclick = () => showView('viewInspector');
++    rebuildTopology();
++    showView('viewJoin');
++  }
++
++  function rebuildTopology() {
++    const role = document.getElementById('joinRole').value;
++    const wrap = document.getElementById('topologyBuilder');
++    wrap.innerHTML = '';
++    if (!currentProtocol || !role) { wrap.innerHTML = '<div class="empty">Select a role first</div>'; return; }
++
++    const others = currentProtocol.roles.filter(r => r !== role);
++    if (!others.length) { wrap.innerHTML = '<div class="empty">No other roles</div>'; return; }
++
++    others.forEach(r => {
++      const row = document.createElement('div');
++      row.className = 'topology-row';
++      row.innerHTML = `
++        <div class="topology-role">${r}</div>
++        <input type="text" data-role="${r}" placeholder="http://host:port/{their_uuid}">`;
++      wrap.appendChild(row);
++    });
++  }
++
++  async function submitJoin() {
++    const masId    = document.getElementById('joinMasId').value.trim();
++    const role     = document.getElementById('joinRole').value;
++    const errEl    = document.getElementById('joinError');
++    errEl.style.display = 'none';
++
++    if (!masId || !role) { errEl.textContent = 'MAS ID and Role are required.'; errEl.style.display = 'block'; return; }
++
++    const topology = {};
++    document.querySelectorAll('#topologyBuilder input[data-role]').forEach(inp => {
++      const url = inp.value.trim();
++      if (url) topology[inp.dataset.role] = url;
++    });
++
++    const body = { mas_id: masId, protocol_name: currentProtocol.name, role, topology };
+ 
+-        async function send(messageName) {
+-            if (!currentEnactmentId) return;
+-            const container = document.getElementById(`msg-box-${messageName}`);
+-            const payload = {};
+-            
+-            // Gather inputs
+-            container.querySelectorAll('input').forEach(inp => {
+-                if (inp.value) payload[inp.getAttribute('data-param')] = inp.value;
+-            });
+-
+-            try {
+-                const res = await fetch(`${BASE_URL}/enactments/${currentEnactmentId}/send/${messageName}`, {
+-                    method: 'POST',
+-                    headers: {'Content-Type': 'application/json'},
+-                    body: JSON.stringify({ payload: payload })
+-                });
+-                
+-                if (res.ok) {
+-                    fetchActions(); 
+-                } else {
+-                    const err = await res.json();
+-                    // Force JSON objects/arrays to strings to expose exact system faults
+-                    const errMsg = typeof err.detail === 'object' ? JSON.stringify(err.detail, null, 2) : err.detail;
+-                    alert("Protocol Violation or Error:\n" + errMsg);
+-                }
+-            } catch (e) {
+-                alert("Network Error: " + e);
+-            }
++    try {
++      const res  = await fetch(`${BASE}/api/join`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
++      const data = await res.json();
++      if (!res.ok) { errEl.textContent = data.detail || 'Join failed'; errEl.style.display = 'block'; return; }
++      toast('Joined MAS successfully!', 'ok');
++      goToDashboard(masId, role, currentProtocol.name);
++    } catch(e) { errEl.textContent = 'Network error: ' + e; errEl.style.display = 'block'; }
++  }
++
++  // ── Dashboard ──────────────────────────────────────────────────────
++  function goToDashboard(masId, role, protocol) {
++    currentMasId = masId;
++    currentEnactmentId = null;
++    lastActionsHash = '';
++    lastKBHash = '';
++
++    document.getElementById('dashAgentName').textContent  = agentName || 'Agent';
++    document.getElementById('dashSubtitle').textContent   = `UUID: ${agentId}`;
++    document.getElementById('dashRolePill').textContent   = role;
++    document.getElementById('dashMasPill').textContent    = masId;
++
++    window.history.pushState({}, '', `/${agentId}/dashboard`);
++    showView('viewDashboard');
++    loadDashboard();
++    clearInterval(pollTimer);
++    pollTimer = setInterval(pollDashboard, 3000);
++  }
++
++  function openDashboard() {
++    // Called on direct URL load — restore from server
++    showView('viewDashboard');
++    fetch(`${BASE}/api/agents`).then(r => r.json()).then(data => {
++      if (data.mas_sessions.length) {
++        const s = data.mas_sessions[0];
++        currentMasId = s.mas_id;
++        document.getElementById('dashAgentName').textContent = agentName || 'Agent';
++        document.getElementById('dashSubtitle').textContent  = `UUID: ${agentId}`;
++        document.getElementById('dashRolePill').textContent  = s.role;
++        document.getElementById('dashMasPill').textContent   = s.mas_id;
++      }
++      loadDashboard();
++      clearInterval(pollTimer);
++      pollTimer = setInterval(pollDashboard, 3000);
++    });
++  }
++
++  async function loadDashboard() {
++    await loadEnactmentList();
++    await refreshActions();
++    await refreshKnowledgeBase();
++  }
++
++  function pollDashboard() {
++    refreshActions();
++    refreshKnowledgeBase();
++  }
++
++  // ── Enactment list ─────────────────────────────────────────────────
++  async function loadEnactmentList() {
++    if (!currentMasId) return;
++    try {
++      const res  = await fetch(`${BASE}/api/agents`);
++      const data = await res.json();
++      const sess = data.mas_sessions.find(s => s.mas_id === currentMasId);
++      if (!sess) return;
++      
++      const sel = document.getElementById('dashEnactmentSelect');
++      const currentVal = sel.value;
++      sel.innerHTML = '<option value="">— None selected —</option>';
++      
++      sess.enactment_ids.forEach(eid => {
++        const opt = document.createElement('option');
++        opt.value = eid;
++        opt.textContent = eid;
++        sel.appendChild(opt);
++      });
++      
++      // Preserve selection if it still exists
++      if (sess.enactment_ids.includes(currentVal)) {
++        sel.value = currentVal;
++      } else if (!currentEnactmentId && sess.enactment_ids.length > 0) {
++        // Auto-select the first one if none selected
++        sel.value = sess.enactment_ids[0];
++        onEnactmentSelected();
++      }
++    } catch {}
++  }
++
++  async function startEnactment() {
++    if (!currentMasId) { toast('Join a MAS first', 'error'); return; }
++    const eid = document.getElementById('dashEnactmentId').value.trim();
++    const body = { enactment_id: eid || null, bindings: {} };
++
++    try {
++      const res  = await fetch(`${BASE}/${agentId}/enactments?mas_id=${currentMasId}`, {
++        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
++      });
++      const data = await res.json();
++      if (!res.ok) { toast(data.detail || 'Failed', 'error'); return; }
++
++      currentEnactmentId = data.enactment_id;
++      document.getElementById('dashEnactmentId').value = '';
++
++      // Add to selector
++      const sel = document.getElementById('dashEnactmentSelect');
++      if (!Array.from(sel.options).find(o => o.value === data.enactment_id)) {
++        const opt = document.createElement('option');
++        opt.value = data.enactment_id; opt.textContent = data.enactment_id;
++        sel.appendChild(opt);
++      }
++      sel.value = data.enactment_id;
++      document.getElementById('dashCurrentEnactment').textContent = `Active: ${data.enactment_id}`;
++      lastActionsHash = '';
++      toast('Enactment started', 'ok');
++      await refreshActions();
++    } catch(e) { toast('Network error', 'error'); }
++  }
++
++  function onEnactmentSelected() {
++    const eid = document.getElementById('dashEnactmentSelect').value;
++    if (!eid) return;
++    currentEnactmentId = eid;
++    document.getElementById('dashCurrentEnactment').textContent = `Active: ${eid}`;
++    lastActionsHash = '';
++    refreshActions();
++  }
++
++  // ── Actions ────────────────────────────────────────────────────────
++  async function refreshActions() {
++    if (!currentEnactmentId || !currentMasId) return;
++    try {
++      const res  = await fetch(`${BASE}/${agentId}/enactments/${currentEnactmentId}/actions?mas_id=${currentMasId}`);
++      if (!res.ok) return;
++      const data = await res.json();
++
++      // Bindings
++      renderBindings(data.bindings);
++
++      // Actions diff
++      const hash = JSON.stringify(data.actions);
++      if (hash === lastActionsHash) return;
++      lastActionsHash = hash;
++      renderActions(data.actions);
++    } catch {}
++  }
++
++  function renderBindings(bindings) {
++    const wrap = document.getElementById('dashBindings');
++    const keys = Object.keys(bindings);
++    if (!keys.length) { wrap.innerHTML = '<div class="empty" style="padding:10px;">No bindings yet</div>'; return; }
++    wrap.innerHTML = '';
++    keys.forEach(k => {
++      const row = document.createElement('div');
++      row.style.cssText = 'display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:.8rem;';
++      row.innerHTML = `<span style="color:var(--muted);font-family:'JetBrains Mono',monospace;">${k}</span>
++                       <span style="font-weight:500;">${bindings[k]}</span>`;
++      wrap.appendChild(row);
++    });
++  }
++
++  function renderActions(actions) {
++    const wrap = document.getElementById('dashActions');
++    if (!actions.length) {
++      wrap.innerHTML = '<div class="empty" style="padding:18px;">Waiting for peer messages…</div>';
++      return;
++    }
++    wrap.innerHTML = '';
++    actions.forEach(action => {
++      const box = document.createElement('div');
++      box.className = 'action-box';
++      box.id = `action-${action.message}`;
++
++      const arrowStr = `${action.sender} → ${action.recipients.join(', ')}`;
++      let html = `<div class="action-title">
++        <span>${action.message}</span>
++        <span class="action-arrow">${arrowStr}</span>
++      </div>`;
++
++      action.outs.forEach(p => {
++        if (p.is_key) {
++          html += `<div class="param-row">
++            <span class="param-tag tag-key">key: ${p.name}</span>
++            <span class="param-key-note">auto-managed</span>
++          </div>`;
++        } else {
++          const pre = action.known[p.name] ? ` value="${action.known[p.name]}"` : '';
++          html += `<div class="param-row">
++            <span class="param-tag tag-out">out: ${p.name}</span>
++            <input type="text" data-param="${p.name}" placeholder="${p.name}"${pre}>
++          </div>`;
+         }
+-        
+-        // Auto-poll state every 3 seconds
+-        setInterval(() => {
+-            if (currentEnactmentId && document.getElementById('interactionPanel').style.display === 'block') {
+-                fetchActions();
+-            }
+-        }, 3000);
+-    </script>
++      });
++
++      html += `<button class="btn btn-primary btn-sm" style="margin-top:8px;" onclick="sendMessage('${action.message}')">Send ${action.message}</button>`;
++      box.innerHTML = html;
++      wrap.appendChild(box);
++    });
++  }
++
++  async function sendMessage(msgName) {
++    const box = document.getElementById(`action-${msgName}`);
++    const payload = {};
++    box.querySelectorAll('input[data-param]').forEach(inp => {
++      if (inp.value.trim()) payload[inp.dataset.param] = inp.value.trim();
++    });
++
++    try {
++      const res  = await fetch(`${BASE}/${agentId}/enactments/${currentEnactmentId}/send/${msgName}?mas_id=${currentMasId}`, {
++        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ payload })
++      });
++      const data = await res.json();
++      if (res.ok) {
++        toast(`Sent ${msgName}`, 'ok');
++        lastActionsHash = '';
++        refreshActions();
++        refreshKnowledgeBase();
++      } else {
++        toast(typeof data.detail === 'object' ? JSON.stringify(data.detail) : data.detail, 'error');
++      }
++    } catch(e) { toast('Network error: ' + e, 'error'); }
++  }
++
++  // ── Knowledge Base ─────────────────────────────────────────────────
++  async function refreshKnowledgeBase() {
++    if (!agentId) return;
++    try {
++      const res  = await fetch(`${BASE}/${agentId}/knowledge_base`);
++      const data = await res.json();
++
++      const hash = JSON.stringify(data.knowledge_base);
++      if (hash === lastKBHash) return;
++      lastKBHash = hash;
++      renderKnowledgeBase(data.knowledge_base);
++    } catch {}
++  }
++
++  function renderKnowledgeBase(kb) {
++    const wrap = document.getElementById('dashKB');
++    const masKeys = Object.keys(kb);
++    if (!masKeys.length) { wrap.innerHTML = '<div class="empty">No history yet</div>'; return; }
++
++    wrap.innerHTML = '';
++    masKeys.forEach(masId => {
++      const session = kb[masId];
++      const groups  = session.enactments;
++      const gKeys   = Object.keys(groups);
++
++      const header = document.createElement('div');
++      header.style.cssText = 'margin-bottom:12px;';
++      header.innerHTML = `<div style="font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:8px;">
++        ${session.protocol} · ${session.role} · ${masId}
++      </div>`;
++      wrap.appendChild(header);
++
++      if (!gKeys.length) {
++        const empty = document.createElement('div');
++        empty.className = 'empty';
++        empty.textContent = 'No messages recorded yet';
++        wrap.appendChild(empty);
++        return;
++      }
++
++      gKeys.forEach(keyVal => {
++        const msgs = groups[keyVal];
++        const group = document.createElement('div');
++        group.className = 'kb-group';
++        group.innerHTML = `<div class="kb-group-header">Enactment key: ${keyVal} (${msgs.length} message${msgs.length !== 1 ? 's' : ''})</div>`;
++        msgs.forEach(m => {
++          const payloadStr = Object.entries(m.payload).map(([k,v]) => `${k}=${v}`).join(', ');
++          const row = document.createElement('div');
++          row.className = 'kb-msg-row';
++          row.innerHTML = `<div class="kb-msg-name">${m.message}</div><div class="kb-payload">${payloadStr || '—'}</div>`;
++          group.appendChild(row);
++        });
++        wrap.appendChild(group);
++      });
++    });
++  }
++</script>
+ </body>
+ </html>
+\ No newline at end of file
+diff --git a/launcher_ui.py b/launcher_ui.py
+index bab33ab..1c091b2 100644
+--- a/launcher_ui.py
++++ b/launcher_ui.py
+@@ -7,140 +7,171 @@ import webbrowser
+ import threading
+ import time
+ 
++
+ class AgentLauncherApp:
+     def __init__(self, root):
+         self.root = root
+         self.root.title("Sliq Agent Launcher")
+-        self.root.geometry("600x550") 
+-        self.root.configure(padx=20, pady=20)
++        self.root.geometry("560x460")
++        self.root.configure(padx=20, pady=20, bg="#1e1e2e")
+         self.root.resizable(False, False)
+         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
+         self.process = None
+ 
+-        tk.Label(root, text="Sliq Node Configuration", font=("Helvetica", 12, "bold")).pack(pady=(0, 15))
+-
+-        # Inputs Frame
+-        input_frame = tk.Frame(root)
+-        input_frame.pack(fill="x", pady=(0, 10))
+-
+-        tk.Label(input_frame, text="Agent Name/Role:").grid(row=0, column=0, sticky="w", pady=5)
+-        self.agent_name_var = tk.StringVar(value="Merchant")
+-        tk.Entry(input_frame, textvariable=self.agent_name_var, width=30).grid(row=0, column=1, sticky="w", padx=10)
+-
+-        tk.Label(input_frame, text="API Port:").grid(row=1, column=0, sticky="w", pady=5)
++        # ── Title ──────────────────────────────────────────────────
++        tk.Label(
++            root, text="Sliq — BSPL Agent Node Launcher",
++            font=("Segoe UI", 13, "bold"),
++            bg="#1e1e2e", fg="#cdd6f4"
++        ).pack(pady=(0, 18))
++
++        # ── Input frame ────────────────────────────────────────────
++        frm = tk.Frame(root, bg="#1e1e2e")
++        frm.pack(fill="x")
++
++        def label(text, row):
++            tk.Label(frm, text=text, bg="#1e1e2e", fg="#a6adc8",
++                     font=("Segoe UI", 10), anchor="w").grid(
++                row=row, column=0, sticky="w", pady=6, padx=(0, 12))
++
++        label("Agent Name:", 0)
++        self.agent_name_var = tk.StringVar(value="Alice")
++        tk.Entry(frm, textvariable=self.agent_name_var, width=28,
++                 font=("Segoe UI", 10), bg="#313244", fg="#cdd6f4",
++                 insertbackground="white", relief="flat", bd=6).grid(
++            row=0, column=1, sticky="w")
++
++        label("API Port:", 1)
+         self.api_port_var = tk.StringVar(value="8001")
+-        tk.Entry(input_frame, textvariable=self.api_port_var, width=15).grid(row=1, column=1, sticky="w", padx=10)
+-
+-        tk.Label(input_frame, text="Receiver Port:").grid(row=2, column=0, sticky="w", pady=5)
+-        self.recv_port_var = tk.StringVar(value="9001")
+-        tk.Entry(input_frame, textvariable=self.recv_port_var, width=15).grid(row=2, column=1, sticky="w", padx=10)
+-
+-        # The Universal Topology Injector
+-        tk.Label(input_frame, text="Network Topology (BASE_URLS):").grid(row=3, column=0, sticky="nw", pady=5)
+-        self.base_urls_text = tk.Text(input_frame, width=40, height=4, font=("Courier", 9))
+-        self.base_urls_text.grid(row=3, column=1, sticky="w", padx=10, pady=5)
+-        self.base_urls_text.insert("1.0", "Merchant=http://127.0.0.1:9001,\nLabeler=http://127.0.0.1:9002,\nWrapper=http://127.0.0.1:9003,\nPacker=http://127.0.0.1:9004")
+-
+-        # Buttons Frame
+-        btn_frame = tk.Frame(root)
+-        btn_frame.pack(pady=15)
+-
+-        self.launch_btn = tk.Button(btn_frame, text="Launch Agent", command=self.launch_agent, bg="#4CAF50", fg="white", font=("Helvetica", 10, "bold"), width=15)
+-        self.launch_btn.pack(side="left", padx=10)
++        tk.Entry(frm, textvariable=self.api_port_var, width=10,
++                 font=("Segoe UI", 10), bg="#313244", fg="#cdd6f4",
++                 insertbackground="white", relief="flat", bd=6).grid(
++            row=1, column=1, sticky="w")
++
++        label("Public Host:", 2)
++        self.public_host_var = tk.StringVar(value="127.0.0.1")
++        tk.Entry(frm, textvariable=self.public_host_var, width=20,
++                 font=("Segoe UI", 10), bg="#313244", fg="#cdd6f4",
++                 insertbackground="white", relief="flat", bd=6).grid(
++            row=2, column=1, sticky="w")
++
++        # ── Buttons ────────────────────────────────────────────────
++        btn_frm = tk.Frame(root, bg="#1e1e2e")
++        btn_frm.pack(pady=16)
++
++        self.launch_btn = tk.Button(
++            btn_frm, text="▶  Launch Node", command=self.launch_agent,
++            bg="#89b4fa", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
++            width=14, relief="flat", bd=0, cursor="hand2"
++        )
++        self.launch_btn.pack(side="left", padx=8)
+ 
+-        self.stop_btn = tk.Button(btn_frame, text="Stop Agent", command=self.stop_agent, state=tk.DISABLED, bg="#f44336", fg="white", font=("Helvetica", 10, "bold"), width=15)
+-        self.stop_btn.pack(side="left", padx=10)
++        self.stop_btn = tk.Button(
++            btn_frm, text="■  Stop Node", command=self.stop_agent,
++            state=tk.DISABLED,
++            bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
++            width=14, relief="flat", bd=0, cursor="hand2"
++        )
++        self.stop_btn.pack(side="left", padx=8)
+ 
+-        # Status and Logs
+-        self.status_label = tk.Label(root, text="Status: Ready", fg="gray", font=("Helvetica", 10, "italic"))
++        # ── Status ─────────────────────────────────────────────────
++        self.status_label = tk.Label(
++            root, text="Status: Ready", fg="#6c7086",
++            bg="#1e1e2e", font=("Segoe UI", 9, "italic")
++        )
+         self.status_label.pack()
+ 
+-        self.log_area = scrolledtext.ScrolledText(root, height=12, width=70, state=tk.DISABLED, bg="#1e1e1e", fg="#00ff00", font=("Consolas", 9))
+-        self.log_area.pack(pady=10)
++        # ── Log panel ──────────────────────────────────────────────
++        self.log_area = scrolledtext.ScrolledText(
++            root, height=10, width=66, state=tk.DISABLED,
++            bg="#181825", fg="#a6e3a1", font=("Consolas", 9),
++            relief="flat", bd=4, insertbackground="white"
++        )
++        self.log_area.pack(pady=(10, 0))
+ 
+-    def log_message(self, message):
++    # ── Logging ────────────────────────────────────────────────────
++    def log(self, message: str):
+         self.log_area.config(state=tk.NORMAL)
+         self.log_area.insert(tk.END, message)
+         self.log_area.see(tk.END)
+         self.log_area.config(state=tk.DISABLED)
+ 
++    # ── Launch ─────────────────────────────────────────────────────
+     def launch_agent(self):
+-        agent_name = self.agent_name_var.get().strip()
+-        api_port = self.api_port_var.get().strip()
+-        recv_port = self.recv_port_var.get().strip()
+-        base_urls = self.base_urls_text.get("1.0", tk.END).strip().replace("\n", "")
++        agent_name  = self.agent_name_var.get().strip()
++        api_port    = self.api_port_var.get().strip()
++        public_host = self.public_host_var.get().strip()
+ 
+-        if not agent_name or not api_port or not recv_port:
+-            messagebox.showerror("Error", "Please fill in all standard fields.")
++        if not agent_name:
++            messagebox.showerror("Error", "Agent Name is required.")
++            return
++        if not api_port.isdigit():
++            messagebox.showerror("Error", "API Port must be a number.")
+             return
+ 
+         env = os.environ.copy()
+-        env["AGENT_NAME"] = agent_name
+-        env["API_PORT"] = api_port
+-        env["RECEIVER_PORT"] = recv_port
+-        env["BASE_URLS"] = base_urls
++        env["AGENT_NAME"]   = agent_name
++        env["API_PORT"]     = api_port
++        env["PUBLIC_HOST"]  = public_host or "127.0.0.1"
+ 
+         self.log_area.config(state=tk.NORMAL)
+         self.log_area.delete(1.0, tk.END)
+         self.log_area.config(state=tk.DISABLED)
+ 
+-        self.status_label.config(text=f"Status: Starting {agent_name}...", fg="orange")
++        self.status_label.config(text=f"Status: Starting '{agent_name}'...", fg="#f9e2af")
+         self.launch_btn.config(state=tk.DISABLED)
+         self.stop_btn.config(state=tk.NORMAL)
+ 
+-        threading.Thread(target=self._run_process, args=(env, api_port), daemon=True).start()
+-
+-    def _run_process(self, env, api_port):
+-        python_exec = sys.executable 
+-        cmd = [python_exec, "agent_api.py"]
++        threading.Thread(
++            target=self._run_process, args=(env, api_port, agent_name), daemon=True
++        ).start()
+ 
++    def _run_process(self, env, api_port, agent_name):
++        cmd = [sys.executable, "agent_api.py"]
+         self.process = subprocess.Popen(
+-            cmd,
+-            env=env,
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            text=True,
+-            bufsize=1,
+-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
++            cmd, env=env,
++            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++            text=True, bufsize=1,
++            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+         )
+-
+-        self.root.after(0, lambda: self.status_label.config(text=f"Status: Running on Port {api_port}", fg="green"))
+-        self.root.after(0, lambda: self.log_message(f"--- Starting {env['AGENT_NAME']} API Server on port {api_port} ---\n"))
+-        
+-        threading.Thread(target=self.open_browser, args=(api_port,), daemon=True).start()
+-
+-        for line in iter(self.process.stdout.readline, ''):
++        self.root.after(0, lambda: self.status_label.config(
++            text=f"Status: '{agent_name}' running on :{api_port}", fg="#a6e3a1"
++        ))
++        self.root.after(0, lambda: self.log(
++            f"─── Node '{agent_name}' started on port {api_port} ───\n"
++        ))
++        threading.Thread(target=self._open_browser, args=(api_port,), daemon=True).start()
++
++        for line in iter(self.process.stdout.readline, ""):
+             if line:
+-                self.root.after(0, lambda l=line: self.log_message(l))
+-        
++                self.root.after(0, lambda l=line: self.log(l))
++
+         self.process.stdout.close()
+-        return_code = self.process.wait()
+-        
+-        self.root.after(0, lambda: self.log_message(f"\n[Server Process Exited with Code {return_code}]\n"))
+-        
+-        if return_code != 0 and self.process is not None:
+-            self.root.after(0, self._reset_ui_error)
+-
+-    def _reset_ui_error(self):
++        rc = self.process.wait()
++        self.root.after(0, lambda: self.log(f"\n[Process exited with code {rc}]\n"))
++        if rc != 0 and self.process is not None:
++            self.root.after(0, self._reset_error)
++
++    def _reset_error(self):
+         self.launch_btn.config(state=tk.NORMAL)
+         self.stop_btn.config(state=tk.DISABLED)
+-        self.status_label.config(text="Status: Crashed (See Logs)", fg="red")
++        self.status_label.config(text="Status: Crashed — see log", fg="#f38ba8")
+ 
+-    def open_browser(self, port):
+-        time.sleep(2.5) 
++    def _open_browser(self, port):
++        time.sleep(2.5)
+         if self.process and self.process.poll() is None:
+-            webbrowser.open(f"http://127.0.0.1:{port}/dashboard.html")
++            webbrowser.open(f"http://127.0.0.1:{port}/")
+ 
++    # ── Stop ───────────────────────────────────────────────────────
+     def stop_agent(self):
+         if self.process:
+             self.process.terminate()
+-            self.process.wait() 
++            self.process.wait()
+             self.process = None
+-        
+         self.launch_btn.config(state=tk.NORMAL)
+         self.stop_btn.config(state=tk.DISABLED)
+-        self.status_label.config(text="Status: Stopped", fg="gray")
+-        self.log_message("\n--- Agent Stopped ---\n")
++        self.status_label.config(text="Status: Stopped", fg="#6c7086")
++        self.log("\n─── Node stopped ───\n")
+ 
+     def on_window_close(self):
+         if self.process:
+@@ -151,5 +182,5 @@ class AgentLauncherApp:
+ 
+ if __name__ == "__main__":
+     root = tk.Tk()
+-    app = AgentLauncherApp(root)
++    app  = AgentLauncherApp(root)
+     root.mainloop()
+\ No newline at end of file
+diff --git a/protocols/reference/auction.bspl b/protocols/reference/auction.bspl
+new file mode 100644
+index 0000000..35a3b6d
+--- /dev/null
++++ b/protocols/reference/auction.bspl
+@@ -0,0 +1,9 @@
++Auction {
++  roles Auctioneer, Bidder
++  parameters out auctionID key, out winner
++  private item, bidID, amount
++
++  Auctioneer -> Bidder: Open[out auctionID, out item]
++  Bidder -> Auctioneer: Bid[in auctionID, out bidID key, out amount]
++  Auctioneer -> Bidder: Award[in auctionID, in bidID, out winner]
++}
+diff --git a/storage/agent_registry.json b/storage/agent_registry.json
+new file mode 100644
+index 0000000..10a2d68
+--- /dev/null
++++ b/storage/agent_registry.json
+@@ -0,0 +1,6 @@
++{
++  "jack": "291c3626-b5f4-439c-825b-7d60c4988c4e",
++  "ali": "88738474-59fc-4328-9c78-ea4a6101fb31",
++  "bob": "172cad66-586a-40eb-a09f-75530a85a7e6",
++  "alice": "b23762d1-e436-49b7-882b-2861e150f8f5"
++}
+\ No newline at end of file
+diff --git a/storage/system_state.json b/storage/system_state.json
+new file mode 100644
+index 0000000..ebee50a
+--- /dev/null
++++ b/storage/system_state.json
+@@ -0,0 +1,229 @@
++{
++  "172cad66-586a-40eb-a09f-75530a85a7e6": {
++    "purchaseMAS1": {
++      "config": {
++        "mas_id": "purchaseMAS1",
++        "protocol_name": "Purchase",
++        "role": "Seller",
++        "topology": {
++          "Buyer": "http://127.0.0.1:8001/88738474-59fc-4328-9c78-ea4a6101fb31",
++          "Shipper": "http://127.0.0.1:8003/b23762d1-e436-49b7-882b-2861e150f8f5"
++        }
++      },
++      "enactments": {
++        "purchase1": {
++          "protocol": "Purchase",
++          "role": "Seller",
++          "bindings": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "price": "500",
++            "resp": "ok, I will buy it",
++            "address": "Lancaster",
++            "shipped": "ok, I shipped it"
++          }
++        }
++      },
++      "history": [
++        {
++          "schema": "Purchase/rfq",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1",
++            "received": "2026-03-13 10:43:45.596332"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/quote",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "price": "500"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/accept",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "price": "500",
++            "resp": "ok, I will buy it",
++            "address": "Lancaster"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1",
++            "received": "2026-03-13 10:52:45.488494"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/ship",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "address": "Lancaster",
++            "shipped": "ok, I shipped it"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1"
++          },
++          "system": "default"
++        }
++      ]
++    }
++  },
++  "b23762d1-e436-49b7-882b-2861e150f8f5": {
++    "purchaseMAS1": {
++      "config": {
++        "mas_id": "purchaseMAS1",
++        "protocol_name": "Purchase",
++        "role": "Shipper",
++        "topology": {
++          "Buyer": "http://127.0.0.1:8001/88738474-59fc-4328-9c78-ea4a6101fb31",
++          "Seller": "http://127.0.0.1:8002/172cad66-586a-40eb-a09f-75530a85a7e6"
++        }
++      },
++      "enactments": {
++        "purchase1": {
++          "protocol": "Purchase",
++          "role": "Shipper",
++          "bindings": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "address": "Lancaster",
++            "shipped": "ok, I shipped it",
++            "outcome": "delivered"
++          }
++        }
++      },
++      "history": [
++        {
++          "schema": "Purchase/ship",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "address": "Lancaster",
++            "shipped": "ok, I shipped it"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1",
++            "received": "2026-03-13 10:52:53.677307"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/deliver",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "address": "Lancaster",
++            "outcome": "delivered"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1"
++          },
++          "system": "default"
++        }
++      ]
++    }
++  },
++  "88738474-59fc-4328-9c78-ea4a6101fb31": {
++    "purchaseMAS1": {
++      "config": {
++        "mas_id": "purchaseMAS1",
++        "protocol_name": "Purchase",
++        "role": "Buyer",
++        "topology": {
++          "Seller": "http://127.0.0.1:8002/172cad66-586a-40eb-a09f-75530a85a7e6",
++          "Shipper": "http://127.0.0.1:8003/b23762d1-e436-49b7-882b-2861e150f8f5"
++        }
++      },
++      "enactments": {
++        "purchase1": {
++          "protocol": "Purchase",
++          "role": "Buyer",
++          "bindings": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "price": "500",
++            "resp": "ok, I will buy it",
++            "address": "Lancaster",
++            "outcome": "delivered"
++          }
++        }
++      },
++      "history": [
++        {
++          "schema": "Purchase/rfq",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/quote",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "price": "500"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1",
++            "received": "2026-03-13 10:52:22.052291"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/accept",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "price": "500",
++            "resp": "ok, I will buy it",
++            "address": "Lancaster"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1"
++          },
++          "system": "default"
++        },
++        {
++          "schema": "Purchase/deliver",
++          "payload": {
++            "item": "laptop",
++            "ID": "purchase1",
++            "address": "Lancaster",
++            "outcome": "delivered"
++          },
++          "meta": {
++            "system": "default",
++            "enactment": "purchase1",
++            "received": "2026-03-13 10:53:15.053698"
++          },
++          "system": "default"
++        }
++      ]
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/testing/bspl_init.py b/testing/bspl_init.py
+new file mode 100644
+index 0000000..a84dfff
+--- /dev/null
++++ b/testing/bspl_init.py
+@@ -0,0 +1,3 @@
++__version__ = "0.1.0"
++from .parsers.bspl import load_file
++
+diff --git a/testing/setup_ui_test.py b/testing/setup_ui_test.py
+new file mode 100644
+index 0000000..c0d9e9b
+--- /dev/null
++++ b/testing/setup_ui_test.py
+@@ -0,0 +1,28 @@
++import os, subprocess, time, sys, requests
++
++def start_node(name, port):
++    env = os.environ.copy()
++    env["AGENT_NAME"] = name
++    env["API_PORT"] = str(port)
++    env["PROTOCOL_DIR"] = "protocols/reference"
++    return subprocess.Popen([sys.executable, "agent_api.py"], env=env)
++
++p1 = start_node("Alice", 8091)
++p2 = start_node("Bob", 8092)
++
++time.sleep(3)
++a = requests.get("http://127.0.0.1:8091/api/identity").json()["agent_id"]
++b = requests.get("http://127.0.0.1:8092/api/identity").json()["agent_id"]
++
++requests.post("http://127.0.0.1:8091/api/join", json={"mas_id":"ui-mas","protocol_name":"Purchase","role":"Buyer","topology":{"Seller":f"http://127.0.0.1:8092/{b}"}})
++requests.post("http://127.0.0.1:8092/api/join", json={"mas_id":"ui-mas","protocol_name":"Purchase","role":"Seller","topology":{"Buyer":f"http://127.0.0.1:8091/{a}"}})
++
++requests.post(f"http://127.0.0.1:8091/{a}/enactments?mas_id=ui-mas", json={"enactment_id":"order-test","bindings":{}})
++requests.post(f"http://127.0.0.1:8091/{a}/enactments/order-test/send/rfq?mas_id=ui-mas", json={"payload":{"item":"Test Laptop", "ID":"42"}})
++
++print("SETUP DONE")
++
++try:
++    while True: time.sleep(1)
++except KeyboardInterrupt:
++    p1.terminate(); p2.terminate()
+diff --git a/testing/test_comprehensive.py b/testing/test_comprehensive.py
+new file mode 100644
+index 0000000..1d5fc8a
+--- /dev/null
++++ b/testing/test_comprehensive.py
+@@ -0,0 +1,356 @@
++#!/usr/bin/env python3
++"""
++Comprehensive end-to-end test for Sliq BSPL multi-agent system.
++Tests: Purchase (3 agents), Logistics (4 agents), Auction (2 agents).
++
++Usage (from project root):
++    .venv/Scripts/python.exe test_comprehensive.py
++"""
++
++import json
++import os
++import subprocess
++import sys
++import time
++from typing import Dict
++
++import requests
++
++BASE   = sys.executable
++SCRIPT = "agent_api.py"
++
++GREEN  = "\033[32m"
++RED    = "\033[31m"
++YELLOW = "\033[33m"
++CYAN   = "\033[36m"
++RESET  = "\033[0m"
++BOLD   = "\033[1m"
++
++passes = fails = 0
++
++
++def ok(msg):
++    global passes
++    passes += 1
++    print(f"  {GREEN}✓{RESET} {msg}")
++
++
++def fail(msg):
++    global fails
++    fails += 1
++    print(f"  {RED}✗{RESET} {msg}")
++
++
++def section(msg):
++    print(f"\n{BOLD}{CYAN}── {msg} ──{RESET}")
++
++
++def start_node(name: str, port: int) -> subprocess.Popen:
++    env = os.environ.copy()
++    env["AGENT_NAME"]    = name
++    env["API_PORT"]      = str(port)
++    env["PROTOCOL_DIR"]  = "protocols/reference"
++    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
++    return subprocess.Popen(
++        [BASE, SCRIPT], env=env,
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++        creationflags=flags,
++    )
++
++
++def wait_for(port: int, retries=24) -> bool:
++    for _ in range(retries):
++        try:
++            if requests.get(f"http://127.0.0.1:{port}/api/identity", timeout=1).status_code == 200:
++                return True
++        except Exception:
++            pass
++        time.sleep(0.5)
++    return False
++
++
++def uuid_of(port: int) -> str:
++    return requests.get(f"http://127.0.0.1:{port}/api/identity").json()["agent_id"]
++
++
++def join(port, mas_id, protocol, role, topology):
++    return requests.post(
++        f"http://127.0.0.1:{port}/api/join",
++        json={"mas_id": mas_id, "protocol_name": protocol, "role": role, "topology": topology},
++    ).json()
++
++
++def start_eid(port, uuid, mas_id, eid):
++    return requests.post(
++        f"http://127.0.0.1:{port}/{uuid}/enactments?mas_id={mas_id}",
++        json={"enactment_id": eid, "bindings": {}},
++    ).json()
++
++
++def actions(port, uuid, mas_id, eid):
++    return requests.get(
++        f"http://127.0.0.1:{port}/{uuid}/enactments/{eid}/actions?mas_id={mas_id}"
++    ).json()
++
++
++def send(port, uuid, mas_id, eid, msg, payload):
++    return requests.post(
++        f"http://127.0.0.1:{port}/{uuid}/enactments/{eid}/send/{msg}?mas_id={mas_id}",
++        json={"payload": payload},
++    ).json()
++
++
++def wait_action(port, uuid, mas_id, eid, msg_name, timeout=10):
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        data = actions(port, uuid, mas_id, eid)
++        if msg_name in [a["message"] for a in data.get("actions", [])]:
++            return data
++        time.sleep(0.5)
++    return actions(port, uuid, mas_id, eid)
++
++
++def wait_invited(port, uuid, mas_id, eid, timeout=6) -> bool:
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        data = actions(port, uuid, mas_id, eid)
++        if "detail" not in data:
++            return True
++        time.sleep(0.4)
++    return False
++
++
++# ═══════════════════════════════════════════════════════════════════
++# TEST 1 — Purchase (Buyer + Seller + Shipper)
++# ═══════════════════════════════════════════════════════════════════
++def test_purchase(bp=8011, sp=8012, jp=8013):
++    section("TEST 1: Purchase Protocol — 3 agents")
++    procs = [start_node(n, p) for n, p in [("TBuyer","TestSeller" if False else "TestBuyer"), ("TestSeller","a"), ("TestShipper","b")]]
++    # Restart properly
++    for p in procs: p.terminate()
++    procs = [start_node("TestBuyer", bp), start_node("TestSeller", sp), start_node("TestShipper", jp)]
++
++    for port, role in [(bp,"Buyer"),(sp,"Seller"),(jp,"Shipper")]:
++        if wait_for(port): ok(f"{role} node up (:{port})")
++        else: fail(f"{role} node failed"); [p.terminate() for p in procs]; return
++
++    b = uuid_of(bp); s = uuid_of(sp); j = uuid_of(jp)
++    ok(f"UUIDs: Buyer={b[:8]}  Seller={s[:8]}  Shipper={j[:8]}")
++
++    mas, eid = "p-mas", "p-e1"
++    for port, role, top in [
++        (bp, "Buyer",   {"Seller": f"http://127.0.0.1:{sp}/{s}", "Shipper": f"http://127.0.0.1:{jp}/{j}"}),
++        (sp, "Seller",  {"Buyer":  f"http://127.0.0.1:{bp}/{b}", "Shipper": f"http://127.0.0.1:{jp}/{j}"}),
++        (jp, "Shipper", {"Buyer":  f"http://127.0.0.1:{bp}/{b}", "Seller":  f"http://127.0.0.1:{sp}/{s}"}),
++    ]:
++        r = join(port, mas, "Purchase", role, top)
++        (ok if r.get("status") == "joined" else fail)(f"{role} joined MAS")
++
++    start_eid(bp, b, mas, eid)
++    data = wait_action(bp, b, mas, eid, "rfq")
++    (ok if "rfq" in [a["message"] for a in data.get("actions",[])] else fail)("Buyer: rfq enabled")
++
++    r = send(bp, b, mas, eid, "rfq", {"item": "Laptop Pro", "ID": "42"})
++    (ok if r.get("status")=="sent" else fail)("Buyer sent rfq")
++
++    (ok if wait_invited(sp, s, mas, eid) else fail)("Seller auto-invited ✓")
++    data = wait_action(sp, s, mas, eid, "quote")
++    (ok if "quote" in [a["message"] for a in data.get("actions",[])] else fail)("Seller: quote enabled")
++    r = send(sp, s, mas, eid, "quote", {"price": "999"})
++    (ok if r.get("status")=="sent" else fail)("Seller sent quote")
++
++    data = wait_action(bp, b, mas, eid, "accept")
++    (ok if "accept" in [a["message"] for a in data.get("actions",[])] else fail)("Buyer: accept enabled")
++    r = send(bp, b, mas, eid, "accept", {"resp": "yes", "address": "Lancaster, UK"})
++    (ok if r.get("status")=="sent" else fail)("Buyer sent accept")
++
++    data = wait_action(sp, s, mas, eid, "ship")
++    (ok if "ship" in [a["message"] for a in data.get("actions",[])] else fail)("Seller: ship enabled")
++    r = send(sp, s, mas, eid, "ship", {"shipped": "dispatched"})
++    (ok if r.get("status")=="sent" else fail)("Seller sent ship")
++
++    (ok if wait_invited(jp, j, mas, eid) else fail)("Shipper auto-invited ✓")
++    data = wait_action(jp, j, mas, eid, "deliver")
++    (ok if "deliver" in [a["message"] for a in data.get("actions",[])] else fail)("Shipper: deliver enabled")
++    r = send(jp, j, mas, eid, "deliver", {"outcome": "delivered"})
++    (ok if r.get("status")=="sent" else fail)("Shipper sent deliver — Purchase COMPLETE")
++
++    kb = requests.get(f"http://127.0.0.1:{bp}/{b}/knowledge_base").json()
++    msgs = [m["message"] for g in kb["knowledge_base"].get(mas,{}).get("enactments",{}).values() for m in g]
++    ok(f"Buyer KB: {msgs}")
++    [p.terminate() for p in procs]
++
++
++# ═══════════════════════════════════════════════════════════════════
++# TEST 2 — Logistics (Merchant, Labeler, Wrapper, Packer)
++# ═══════════════════════════════════════════════════════════════════
++def test_logistics(mp=8021, lp=8022, wp=8023, pp=8024):
++    section("TEST 2: Logistics Protocol — 4 agents")
++    nodes = [("TestMerchant",mp),("TestLabeler",lp),("TestWrapper",wp),("TestPacker",pp)]
++    procs = [start_node(n, p) for n, p in nodes]
++    uuids: Dict[str, str] = {}
++
++    for name, port in nodes:
++        role = name.replace("Test","")
++        if wait_for(port):
++            ok(f"{role} up (:{port})")
++            uuids[role] = uuid_of(port)
++        else:
++            fail(f"{role} failed"); [p.terminate() for p in procs]; return
++
++    ports = {r.replace("Test",""):p for r,p in nodes}
++    def url(role): return f"http://127.0.0.1:{ports[role]}/{uuids[role]}"
++
++    mas, eid = "log-mas", "log-e1"
++    roles = ["Merchant","Labeler","Wrapper","Packer"]
++    for role in roles:
++        top = {r: url(r) for r in roles if r != role}
++        r = join(ports[role], mas, "Logistics", role, top)
++        (ok if r.get("status")=="joined" else fail)(f"{role} joined")
++
++    start_eid(mp, uuids["Merchant"], mas, eid)
++
++    # Merchant → Labeler
++    data = wait_action(mp, uuids["Merchant"], mas, eid, "RequestLabel")
++    (ok if "RequestLabel" in [a["message"] for a in data.get("actions",[])] else fail)("Merchant: RequestLabel")
++    send(mp, uuids["Merchant"], mas, eid, "RequestLabel", {"orderID": "ord-99", "address": "London"})
++    ok("Merchant sent RequestLabel")
++
++    # Merchant → Wrapper
++    data = wait_action(mp, uuids["Merchant"], mas, eid, "RequestWrapping")
++    (ok if "RequestWrapping" in [a["message"] for a in data.get("actions",[])] else fail)("Merchant: RequestWrapping")
++    send(mp, uuids["Merchant"], mas, eid, "RequestWrapping", {"itemID": "i-7", "item": "Crystal Vase"})
++    ok("Merchant sent RequestWrapping")
++
++    # Labeler
++    (ok if wait_invited(lp, uuids["Labeler"], mas, eid) else fail)("Labeler auto-invited ✓")
++    data = wait_action(lp, uuids["Labeler"], mas, eid, "Labeled")
++    (ok if "Labeled" in [a["message"] for a in data.get("actions",[])] else fail)("Labeler: Labeled")
++    r = send(lp, uuids["Labeler"], mas, eid, "Labeled", {"label": "FRAGILE-001"})
++    (ok if r.get("status")=="sent" else fail)("Labeler sent Labeled")
++
++    # Wrapper
++    (ok if wait_invited(wp, uuids["Wrapper"], mas, eid) else fail)("Wrapper auto-invited ✓")
++    data = wait_action(wp, uuids["Wrapper"], mas, eid, "Wrapped")
++    (ok if "Wrapped" in [a["message"] for a in data.get("actions",[])] else fail)("Wrapper: Wrapped")
++    r = send(wp, uuids["Wrapper"], mas, eid, "Wrapped", {"wrapping": "bubble-wrap"})
++    (ok if r.get("status")=="sent" else fail)("Wrapper sent Wrapped")
++
++    # Packer waits for both Labeled + Wrapped
++    (ok if wait_invited(pp, uuids["Packer"], mas, eid) else fail)("Packer auto-invited ✓")
++    data = wait_action(pp, uuids["Packer"], mas, eid, "Packed", timeout=12)
++    (ok if "Packed" in [a["message"] for a in data.get("actions",[])] else fail)("Packer: Packed (after both deps)")
++    r = send(pp, uuids["Packer"], mas, eid, "Packed", {"status": "ready"})
++    (ok if r.get("status")=="sent" else fail)("Packer sent Packed — Logistics COMPLETE")
++
++    [p.terminate() for p in procs]
++
++
++# ═══════════════════════════════════════════════════════════════════
++# TEST 3 — Auction (Auctioneer + Bidder)
++# ═══════════════════════════════════════════════════════════════════
++def test_auction(ap=8031, bp=8032):
++    section("TEST 3: Auction Protocol — 2 agents (NEW)")
++    procs = [start_node("TestAuctioneer", ap), start_node("TestBidder", bp)]
++
++    for port, role in [(ap,"Auctioneer"),(bp,"Bidder")]:
++        if wait_for(port): ok(f"{role} up (:{port})")
++        else: fail(f"{role} failed"); [p.terminate() for p in procs]; return
++
++    a = uuid_of(ap); b = uuid_of(bp)
++    ok(f"Auctioneer={a[:8]}  Bidder={b[:8]}")
++
++    mas, eid = "auct-mas", "auct-e1"
++    r1 = join(ap, mas, "Auction", "Auctioneer", {"Bidder": f"http://127.0.0.1:{bp}/{b}"})
++    r2 = join(bp, mas, "Auction", "Bidder", {"Auctioneer": f"http://127.0.0.1:{ap}/{a}"})
++    (ok if r1.get("status")=="joined" else fail)("Auctioneer joined")
++    (ok if r2.get("status")=="joined" else fail)("Bidder joined")
++
++    start_eid(ap, a, mas, eid)
++    data = wait_action(ap, a, mas, eid, "Open")
++    (ok if "Open" in [x["message"] for x in data.get("actions",[])] else fail)("Auctioneer: Open enabled")
++
++    r = send(ap, a, mas, eid, "Open", {"auctionID": "lot-777", "item": "Van Gogh"})
++    (ok if r.get("status")=="sent" else fail)("Auctioneer sent Open")
++
++    (ok if wait_invited(bp, b, mas, eid) else fail)("Bidder auto-invited ✓")
++    data = wait_action(bp, b, mas, eid, "Bid")
++    (ok if "Bid" in [x["message"] for x in data.get("actions",[])] else fail)("Bidder: Bid enabled after Open")
++
++    r = send(bp, b, mas, eid, "Bid", {"bidID": "bid-001", "amount": "1500000"})
++    (ok if r.get("status")=="sent" else fail)("Bidder sent Bid(1.5M)")
++
++    data = wait_action(ap, a, mas, eid, "Award")
++    (ok if "Award" in [x["message"] for x in data.get("actions",[])] else fail)("Auctioneer: Award enabled")
++
++    r = send(ap, a, mas, eid, "Award", {"winner": "TestBidder"})
++    (ok if r.get("status")=="sent" else fail)("Auctioneer sent Award — Auction COMPLETE")
++
++    kb = requests.get(f"http://127.0.0.1:{ap}/{a}/knowledge_base").json()
++    msgs = [m["message"] for g in kb["knowledge_base"].get(mas,{}).get("enactments",{}).values() for m in g]
++    ok(f"Auctioneer KB: {msgs}")
++    [p.terminate() for p in procs]
++
++
++# ═══════════════════════════════════════════════════════════════════
++# TEST 4 — API correctness
++# ═══════════════════════════════════════════════════════════════════
++def test_api(port=8041):
++    section("TEST 4: API Correctness")
++    proc = start_node("TestApi", port)
++    if not wait_for(port): fail("Node start failed"); proc.terminate(); return
++    ok(f"Node up (:{port})")
++
++    u = uuid_of(port)
++    r = requests.get(f"http://127.0.0.1:{port}/api/identity").json()
++    assert "agent_id" in r and "webhook_base" in r
++    ok(f"Identity OK: {r['agent_name']} / {r['agent_id'][:8]}…")
++
++    protos = requests.get(f"http://127.0.0.1:{port}/protocols").json()["protocols"]
++    assert "Purchase" in protos and "Logistics" in protos and "Auction" in protos, f"{protos}"
++    ok(f"All 3 protocols listed: {protos}")
++
++    spec = requests.get(f"http://127.0.0.1:{port}/protocols/Purchase").json()
++    assert set(spec["roles"]) == {"Buyer","Seller","Shipper"}
++    ok(f"Purchase spec: {spec['roles']}, {len(spec['messages'])} msgs")
++
++    spec = requests.get(f"http://127.0.0.1:{port}/protocols/Auction").json()
++    assert set(spec["roles"]) == {"Auctioneer","Bidder"}
++    ok(f"Auction spec: {spec['roles']}, {[m['name'] for m in spec['messages']]}")
++
++    r = requests.get(f"http://127.0.0.1:{port}/protocols/DoesNotExist")
++    assert r.status_code == 404
++    ok("404 on unknown protocol ✓")
++
++    join(port, "dup", "Purchase", "Buyer", {})
++    r = requests.post(f"http://127.0.0.1:{port}/api/join",
++                      json={"mas_id":"dup","protocol_name":"Purchase","role":"Buyer","topology":{}})
++    assert r.status_code == 409
++    ok("409 on duplicate join ✓")
++
++    r = requests.post(f"http://127.0.0.1:{port}/bad-uuid/messages", json={"schema":"x"})
++    assert r.status_code == 404
++    ok("404 on unknown agent_id ✓")
++
++    r = requests.get(f"http://127.0.0.1:{port}/{u}/dashboard")
++    assert r.status_code == 200 and "Sliq" in r.text
++    ok("Dashboard HTML served correctly ✓")
++
++    proc.terminate()
++
++
++# ═══════════════════════════════════════════════════════════════════
++if __name__ == "__main__":
++    print(f"\n{BOLD}Sliq Comprehensive Test Suite{RESET}")
++    print("=" * 50)
++    test_purchase()
++    time.sleep(1)
++    test_logistics()
++    time.sleep(1)
++    test_auction()
++    time.sleep(1)
++    test_api()
++    section("RESULTS")
++    total = passes + fails
++    print(f"  {GREEN}{BOLD}{passes}/{total} passed{RESET}  {RED}{BOLD}{fails} failed{RESET}\n")
++    sys.exit(0 if fails == 0 else 1)

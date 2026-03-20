@@ -2,391 +2,802 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import uuid
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import bspl
 from bspl.adapter.core import Adapter
-from bspl.adapter.http_adapter import HTTPEmitter, HTTPReceiver
+from bspl.adapter.http_adapter import HTTPEmitter
 from bspl.adapter.event import InitEvent
 from bspl.adapter.message import Message
 
-# -------------------------
-# Config (Static Topology)
-# -------------------------
+# ─────────────────────────────────────────────────────────────────
+# Static config (env vars — only node-level, not agent-level)
+# ─────────────────────────────────────────────────────────────────
 PROTOCOL_DIR = Path(os.getenv("PROTOCOL_DIR", "protocols/reference"))
-GENERATED_DIR = Path(os.getenv("BSPL_GENERATED_DIR", ".bspl_generated")).resolve()
+API_PORT     = int(os.getenv("API_PORT", "8001"))
+AGENT_NAME   = os.getenv("AGENT_NAME", "").strip()
+PUBLIC_HOST  = os.getenv("PUBLIC_HOST", "127.0.0.1")
 
-API_PORT = int(os.getenv("API_PORT", "8001"))
-RECEIVER_PORT = int(os.getenv("RECEIVER_PORT", "9001"))
-MESSAGES_PATH = os.getenv("MESSAGES_PATH", "/messages")
-AGENT_NAME = os.getenv("AGENT_NAME", "GenericAgent").strip()
-PUBLIC_HOST = os.getenv("PUBLIC_HOST", "127.0.0.1") 
-DATA_FILE = Path(os.getenv("BSPL_DATA_FILE", f".agent_state_{AGENT_NAME}.json"))
-BASE_URLS_RAW = os.getenv("BASE_URLS", "")
+STORAGE_DIR   = Path("storage")
+REGISTRY_FILE = STORAGE_DIR / "agent_registry.json"
+STATE_FILE    = STORAGE_DIR / "system_state.json"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(f"agent_api.{AGENT_NAME}")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
+logger = logging.getLogger("sliq")
 
-def parse_base_urls(raw: str) -> Dict[str, str]:
-    raw = (raw or "").strip()
-    if not raw: return {}
-    out = {}
-    for part in raw.split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip().rstrip("/")
-    return out
+# ─────────────────────────────────────────────────────────────────
+# Runtime state
+# ─────────────────────────────────────────────────────────────────
+AGENT_ID: str = ""   # Set at startup from registry
 
-BASE_URLS = parse_base_urls(BASE_URLS_RAW)
+# active_agents[mas_id] = {
+#   "adapter":    Adapter,
+#   "config":     { mas_id, protocol_name, role, topology: Dict[str,str] },
+#   "enactments": { eid: { protocol, role, bindings } }
+# }
+active_agents: Dict[str, dict] = {}
 
-class DynamicHTTPEmitter(HTTPEmitter):
-    async def send(self, message) -> None:
-        dest = message.dest
-        if isinstance(dest, tuple):
-            host, port = dest
-            url = f"http://{host}:{port}{self.path}"
-            payload = self.encode(message)
-            try:
-                resp = await self.client.post(url, json=json.loads(payload))
-                self.stats["bytes"] += len(payload)
-                self.stats["packets"] += 1
-                resp.raise_for_status()
-            except Exception as exc:
-                logger.error(f"Dynamic send failed to {url}: {exc}")
-                raise
+
+# ─────────────────────────────────────────────────────────────────
+# NoOpReceiver — we handle inbound messages via FastAPI route
+# ─────────────────────────────────────────────────────────────────
+class NoOpReceiver:
+    async def task(self, adapter):
+        pass  # FastAPI POST /{agent_id}/messages does the receiving
+
+    async def stop(self):
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────
+# Utility helpers
+# ─────────────────────────────────────────────────────────────────
+def safe_list(x):
+    try:
+        return list(x)
+    except Exception:
+        return []
+
+
+def normalize_name(n: str) -> str:
+    return (n[0].upper() + n[1:]) if n else n
+
+
+def load_protocol(protocol_name: str):
+    pn = normalize_name(protocol_name)
+    path = PROTOCOL_DIR / f"{pn.lower()}.bspl"
+    if not path.exists():
+        path = PROTOCOL_DIR / f"{pn}.bspl"
+    if not path.exists():
+        raise HTTPException(404, f"Protocol '{pn}' not found in {PROTOCOL_DIR}")
+    spec = bspl.load_file(str(path))
+    return spec.protocols[pn], spec
+
+
+def resolve_agent_id(name: str) -> str:
+    """Return persistent UUID for agent name; create it if first use."""
+    STORAGE_DIR.mkdir(exist_ok=True)
+    registry: Dict[str, str] = {}
+    if REGISTRY_FILE.exists():
+        try:
+            registry = json.loads(REGISTRY_FILE.read_text())
+        except Exception:
+            pass
+    key = name.strip().lower()
+    if key not in registry:
+        registry[key] = str(uuid.uuid4())
+        REGISTRY_FILE.write_text(json.dumps(registry, indent=2))
+        logger.info(f"New agent '{name}' registered → {registry[key]}")
+    else:
+        logger.info(f"Agent '{name}' restored   → {registry[key]}")
+    return registry[key]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Core join logic (also called by StateManager.load for recovery)
+# ─────────────────────────────────────────────────────────────────
+class JoinBody(BaseModel):
+    mas_id:        str
+    protocol_name: str
+    role:          str
+    topology:      Dict[str, str]   # { other_role: "http://host:port/{their_uuid}" }
+
+
+async def _do_join(body: JoinBody) -> dict:
+    """Create Adapter + register in active_agents. Idempotent."""
+    if body.mas_id in active_agents:
+        return active_agents[body.mas_id]
+
+    proto, _ = load_protocol(body.protocol_name)
+    protocol_name = normalize_name(body.protocol_name)
+    topology = body.topology
+
+    # HTTPEmitter — sends to peer base URLs + "/messages?mas_id=..."
+    # This ensures the receiver routes the message to the correct MAS session!
+    emitter = HTTPEmitter(base_urls=topology, path=f"/messages?mas_id={body.mas_id}")
+
+    # roles_map: Role object → agent-name string
+    # We use the role name as agent name (one agent per role in our model)
+    roles_map: Dict = {r: r.name for r in proto.roles.values()}
+
+    # agents dict: agent_name → [(host, port)] endpoint list
+    agents: Dict[str, list] = {}
+    for r in proto.roles.values():
+        if r.name == body.role:
+            # Our own address — FastAPI port (receiver is NoOp, so value only
+            # needs to be valid for the Adapter agents dict structure)
+            agents[r.name] = [("127.0.0.1", API_PORT)]
+        elif r.name in topology:
+            parsed = urlparse(topology[r.name])
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 80
+            agents[r.name] = [(host, port)]
         else:
-            raise RuntimeError(f"Unknown destination format: '{dest}'")
+            agents[r.name] = [("127.0.0.1", API_PORT)]
 
-adapters: Dict[Tuple[str, str], Adapter] = {}
-adapter_started: Dict[Tuple[str, str], bool] = {}
-_adapter_init_lock = asyncio.Lock()
-enactments: Dict[str, Dict[str, Any]] = {}
+    systems = {"default": {"protocol": proto, "roles": roles_map}}
 
+    adapter = Adapter(
+        name=body.role,
+        systems=systems,
+        agents=agents,
+        emitter=emitter,
+        receiver=NoOpReceiver(),
+    )
+
+    # Start adapter background event loop
+    adapter.events  = asyncio.Queue()
+    adapter.running = True
+    asyncio.create_task(adapter.update_loop())
+    await adapter.signal(InitEvent())
+
+    slot = {
+        "adapter":    adapter,
+        "config":     {
+            "mas_id":        body.mas_id,
+            "protocol_name": protocol_name,
+            "role":          body.role,
+            "topology":      topology,
+        },
+        "enactments": {},
+    }
+    active_agents[body.mas_id] = slot
+    logger.info(f"Joined MAS '{body.mas_id}' as {body.role} in {protocol_name}")
+    return slot
+
+
+# ─────────────────────────────────────────────────────────────────
+# State persistence
+# ─────────────────────────────────────────────────────────────────
 class StateManager:
+
     @staticmethod
     def save():
-        data = {"enactments": enactments, "history": []}
-        for adapter in adapters.values():
+        STORAGE_DIR.mkdir(exist_ok=True)
+        data: Dict[str, dict] = {}
+        for mas_id, slot in active_agents.items():
+            history_items = []
+            adapter = slot["adapter"]
             for msg in adapter.history.messages():
-                if hasattr(msg, 'schema') and hasattr(msg.schema, 'protocol'):
-                    data["history"].append({
-                        "protocol": msg.schema.protocol.name, "message": msg.schema.name,
-                        "payload": msg.payload, "meta": msg.meta, "system": msg.system
+                try:
+                    schema = getattr(msg, "schema", None)
+                    if schema is None:
+                        continue
+                    raw_payload = getattr(msg, "payload", {}) or {}
+                    history_items.append({
+                        "schema":  schema.qualified_name,
+                        "payload": {str(getattr(k, "name", k)): v for k, v in raw_payload.items()},
+                        "meta":    {k: str(v) for k, v in (getattr(msg, "meta", {}) or {}).items()},
+                        "system":  getattr(msg, "system", "default"),
                     })
+                except Exception:
+                    pass
+
+            data[mas_id] = {
+                "config":     slot["config"],
+                "enactments": slot.get("enactments", {}),
+                "history":    history_items,
+            }
+
+        # Merge with any other agents' data already in the file
+        existing: Dict = {}
+        if STATE_FILE.exists():
+            try:
+                existing = json.loads(STATE_FILE.read_text())
+            except Exception:
+                pass
+        existing[AGENT_ID] = data
+
         try:
-            with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2, default=str)
-        except Exception as e: logger.error(f"Failed to save state: {e}")
+            STATE_FILE.write_text(json.dumps(existing, indent=2, default=str))
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
 
     @staticmethod
     async def load():
-        if not DATA_FILE.exists(): return
+        if not STATE_FILE.exists():
+            return
         try:
-            with open(DATA_FILE, 'r') as f: data = json.load(f)
-            enactments.update(data.get("enactments", {}))
-            
-            needed_adapters = set((rec['protocol'], rec['role']) for rec in enactments.values())
-            for prot, rol in needed_adapters: await ensure_adapter(prot, rol)
+            all_data = json.loads(STATE_FILE.read_text())
+            agent_data: Dict = all_data.get(AGENT_ID, {})
 
-            for item in data.get("history", []):
+            for mas_id, slot_data in agent_data.items():
+                cfg = slot_data.get("config", {})
                 try:
-                    _, spec = load_protocol(item['protocol'])
-                    schema = spec.protocols[normalize_protocol_name(item['protocol'])].messages[item['message']]
-                    msg = Message(schema=schema, payload=item['payload'], meta=item.get('meta', {}), system=item.get('system', 'default'))
-                    for (ap, ar), adapter in adapters.items():
-                        if ap == normalize_protocol_name(item['protocol']):
-                            if not adapter.history.context(msg).find(schema): adapter.history.add(msg)
-                except Exception: pass
-        except Exception as e: logger.error(f"Failed to load state: {e}")
+                    body = JoinBody(
+                        mas_id=cfg["mas_id"],
+                        protocol_name=cfg["protocol_name"],
+                        role=cfg["role"],
+                        topology=cfg.get("topology", {}),
+                    )
+                    await _do_join(body)
+                except Exception as e:
+                    logger.warning(f"Could not restore MAS '{mas_id}': {e}")
+                    continue
 
+                # Restore enactment records
+                active_agents[mas_id]["enactments"] = slot_data.get("enactments", {})
+
+                # Replay message history into adapter
+                adapter = active_agents[mas_id]["adapter"]
+                proto, _ = load_protocol(cfg["protocol_name"])
+                for item in slot_data.get("history", []):
+                    try:
+                        schema_key = item.get("schema", "")
+                        # qualified_name is "ProtocolName.MessageName"
+                        msg_name = schema_key.split(".")[-1]
+                        schema = proto.messages.get(msg_name)
+                        if schema is None:
+                            continue
+                        msg = Message(
+                            schema=schema,
+                            payload=item.get("payload", {}),
+                            meta=item.get("meta", {}),
+                            system=item.get("system", "default"),
+                        )
+                        if not adapter.history.context(msg).find(schema):
+                            adapter.history.add(msg)
+                    except Exception:
+                        pass
+
+            logger.info(f"State restored: {len(agent_data)} MAS session(s)")
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global AGENT_ID
+    if AGENT_NAME:
+        AGENT_ID = resolve_agent_id(AGENT_NAME)
+    else:
+        # Unnamed node — transient UUID (no persistence possible)
+        AGENT_ID = str(uuid.uuid4())
+        logger.warning("AGENT_NAME not set; node identity is transient this session")
+    logger.info(f"Node identity: '{AGENT_NAME}' → {AGENT_ID}  (API on :{API_PORT})")
     await StateManager.load()
     yield
     StateManager.save()
 
-app = FastAPI(title=f"Sliq Agent: {AGENT_NAME}", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-app.mount("/static", StaticFiles(directory="."), name="static")
 
-@app.get("/dashboard.html")
-async def read_dashboard(): return FileResponse('dashboard.html')
+app = FastAPI(title="Sliq BSPL Node", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def safe_list(x):
-    try: return list(x)
-    except: return []
 
-def normalize_protocol_name(n: str) -> str: return (n[0].upper() + n[1:]) if n else n
+# ─────────────────────────────────────────────────────────────────
+# UI routes — serve dashboard.html for both root and agent views
+# ─────────────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return FileResponse("dashboard.html")
 
-def load_protocol(protocol_name: str):
-    protocol_name = normalize_protocol_name(protocol_name)
-    path = PROTOCOL_DIR / f"{protocol_name.lower()}.bspl"
-    if not path.exists(): path = PROTOCOL_DIR / f"{protocol_name}.bspl"
-    if not path.exists(): raise HTTPException(404, f"Protocol {protocol_name} not found")
-    spec = bspl.load_file(str(path))
-    return spec.protocols[protocol_name], spec
 
-async def ensure_adapter(protocol_name: str, role_name: str) -> Adapter:
-    protocol_name = normalize_protocol_name(protocol_name)
-    key = (protocol_name, role_name)
-    if key in adapters: return adapters[key]
+@app.get("/{agent_id}/dashboard")
+async def agent_dashboard(agent_id: str):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent ID")
+    return FileResponse("dashboard.html")
 
-    async with _adapter_init_lock:
-        if key in adapters: return adapters[key]
-        proto, _ = load_protocol(protocol_name)
-        emitter = DynamicHTTPEmitter(base_urls=BASE_URLS, path=MESSAGES_PATH)
-        receiver = HTTPReceiver(host="0.0.0.0", port=RECEIVER_PORT, path=MESSAGES_PATH)
 
-        roles_map = {r: r.name for r in proto.roles.values()}
-        agents = {r.name: [(urlparse(BASE_URLS[r.name]).hostname or "127.0.0.1", urlparse(BASE_URLS[r.name]).port or 80)] if r.name in BASE_URLS else [("127.0.0.1", RECEIVER_PORT)] for r in proto.roles.values()}
+# ─────────────────────────────────────────────────────────────────
+# Identity & node status
+# ─────────────────────────────────────────────────────────────────
+@app.get("/api/identity")
+def get_identity():
+    return {
+        "agent_name": AGENT_NAME,
+        "agent_id":   AGENT_ID,
+        "api_port":   API_PORT,
+        "public_host": PUBLIC_HOST,
+        "webhook_base": f"http://{PUBLIC_HOST}:{API_PORT}/{AGENT_ID}",
+    }
 
-        adapter = Adapter(name=role_name, systems={"default": {"protocol": proto, "roles": roles_map}}, agents=agents, emitter=emitter, receiver=receiver)
-        adapters[key] = adapter
 
-        if not adapter_started.get(key):
-            from asyncio.queues import Queue
-            adapter.events = Queue()
-            adapter.running = True
-            asyncio.create_task(adapter.update_loop())
-            asyncio.create_task(receiver.task(adapter))
-            await adapter.signal(InitEvent())
-            adapter_started[key] = True
+@app.get("/api/agents")
+def get_agents():
+    sessions = []
+    for mas_id, slot in active_agents.items():
+        cfg = slot["config"]
+        sessions.append({
+            "mas_id":          mas_id,
+            "protocol":        cfg["protocol_name"],
+            "role":            cfg["role"],
+            "enactment_ids":   list(slot["enactments"].keys()),
+            "dashboard_url":   f"/{AGENT_ID}/dashboard",
+        })
+    return {
+        "agent_id":    AGENT_ID,
+        "agent_name":  AGENT_NAME,
+        "mas_sessions": sessions,
+    }
 
-        return adapter
 
-@app.get("/vcard")
-def get_vcard(): return {"agent": AGENT_NAME, "endpoint": f"http://{PUBLIC_HOST}:{RECEIVER_PORT}{MESSAGES_PATH}"}
-
+# ─────────────────────────────────────────────────────────────────
+# Protocol discovery
+# ─────────────────────────────────────────────────────────────────
 @app.get("/protocols")
-def get_protocols():
-    return {"protocols": ["Logistics", "Purchase"]}
+def list_protocols():
+    names: List[str] = []
+    if PROTOCOL_DIR.exists():
+        for f in sorted(PROTOCOL_DIR.glob("*.bspl")):
+            names.append(normalize_name(f.stem))
+    return {"protocols": names}
+
 
 @app.get("/protocols/{protocol_name}")
-def get_protocol_details(protocol_name: str):
+def get_protocol_spec(protocol_name: str):
     proto, _ = load_protocol(protocol_name)
-    return {"roles": list(proto.roles.keys())}
 
-class StartEnactmentBody(BaseModel):
-    bindings: Dict[str, Any] = {}
-    peers: Dict[str, str] = {}
+    messages = []
+    for msg in proto.messages.values():
+        ins_list, outs_list = [], []
 
-@app.post("/protocols/{protocol_name}/enactments")
-async def start_enactment(
-    protocol_name: str,
-    body: StartEnactmentBody,
-    background_tasks: BackgroundTasks,
-    role: Optional[str] = Query(None),
-    enactment_id: Optional[str] = Query(None),
-):
-    protocol_name = normalize_protocol_name(protocol_name)
-    if not role and AGENT_NAME: role = AGENT_NAME
-    if not role: raise HTTPException(400, "Role required")
+        for ref in safe_list(getattr(msg, "ins", [])):
+            p = ref.param if hasattr(ref, "param") else ref
+            p_name = str(getattr(p, "name", p)).strip()
+            param_obj = proto.public_parameters.get(p_name) if hasattr(proto, "public_parameters") else None
+            is_key = (param_obj and getattr(param_obj, "key", None) == "key")
+            ins_list.append({
+                "name": p_name,
+                "key":  is_key,
+            })
 
-    await ensure_adapter(protocol_name, role)
+        for ref in safe_list(getattr(msg, "outs", [])):
+            p = ref.param if hasattr(ref, "param") else ref
+            p_name = str(getattr(p, "name", p)).strip()
+            param_obj = proto.public_parameters.get(p_name) if hasattr(proto, "public_parameters") else None
+            is_key = (param_obj and getattr(param_obj, "key", None) == "key")
+            outs_list.append({
+                "name": p_name,
+                "key":  is_key,
+            })
 
-    eid = enactment_id.strip() if enactment_id else str(uuid.uuid4())
-    
-    enactments[eid] = {
-        "protocol": protocol_name, 
-        "role": role, 
-        "bindings": dict(body.bindings or {}),
-        "peers": dict(body.peers or {})
-    }
-    
-    logger.info(f"Enactment {eid} started. Peers: {enactments[eid]['peers']}")
-    background_tasks.add_task(StateManager.save)
-    return {"protocol": protocol_name, "role": role, "enactment_id": eid, "bindings": enactments[eid]["bindings"]}
-
-@app.get("/enactments/{enactment_id}/actions")
-async def get_actions(enactment_id: str, role: Optional[str] = None):
-    if enactment_id not in enactments: raise HTTPException(404, "Enactment not found")
-    record = enactments[enactment_id]
-    protocol_name = record["protocol"]
-    role_name = str(role if role else record.get("role", AGENT_NAME))
-    
-    adapter = await ensure_adapter(protocol_name, role_name)
-    bindings = record["bindings"]
-    updated = False
-
-    # 1. Update Knowledge Base strictly from actuality (History)
-    if hasattr(adapter, "history"):
-        for m in list(adapter.history.messages()):
-            raw_payload = getattr(m, "payload", {}) or {}
-            
-            # CRITICAL: Force primitive string cast to annihilate AST Symbol bleed
-            payload = {str(getattr(k, 'name', k)).strip(): v for k, v in raw_payload.items()}
-            
-            meta = getattr(m, "meta", {}) or {}
-            is_mine = (meta.get("enactment") == enactment_id)
-            
-            # Universal match: Check meta tag OR see if the payload shares our Enactment ID
-            if not is_mine and payload:
-                if enactment_id in payload.values(): is_mine = True
-                elif bindings:
-                    shared_keys = set(payload.keys()).intersection(set(bindings.keys()))
-                    if any(payload[k] == bindings[k] for k in shared_keys): is_mine = True
-            
-            if is_mine:
-                # Deduce authorized parameters for this historical message
-                msg_schema = getattr(m, "schema", None)
-                valid_params = set()
-                if msg_schema:
-                    for p in safe_list(getattr(msg_schema, 'ins', [])) + safe_list(getattr(msg_schema, 'outs', [])):
-                        param_obj = p.param if hasattr(p, 'param') else p
-                        valid_params.add(str(getattr(param_obj, 'name', param_obj)).strip())
-
-                for k, v in payload.items():
-                    # Reject any information not explicitly governed by the protocol schema
-                    if valid_params and k not in valid_params:
-                        continue
-                    if k not in bindings or bindings[k] != v:
-                        bindings[k] = v
-                        updated = True
-    if updated: StateManager.save()
-
-    actions = []
-    # 2. Process enabled actions
-    for m in adapter.enabled_messages.messages():
-        schema = getattr(m, "schema", m)
-        
-        # 3. Causality Cull: Remove schemas already actualized in history
-        already_enacted = False
-        if hasattr(adapter, "history"):
-            for hist_m in adapter.history.messages():
-                h_schema = getattr(hist_m, "schema", None)
-                h_raw_payload = getattr(hist_m, "payload", {}) or {}
-                
-                # CRITICAL: Second string coercion block for the history cull
-                h_payload = {str(getattr(k, 'name', k)).strip(): v for k, v in h_raw_payload.items()}
-                h_meta = getattr(hist_m, "meta", {}) or {}
-                
-                h_is_mine = (h_meta.get("enactment") == enactment_id)
-                if not h_is_mine and h_payload:
-                    if enactment_id in h_payload.values(): h_is_mine = True
-                    elif bindings:
-                        s_keys = set(h_payload.keys()).intersection(set(bindings.keys()))
-                        if any(h_payload[k] == bindings[k] for k in s_keys): h_is_mine = True
-
-                if h_schema == schema and h_is_mine:
-                    already_enacted = True
-                    break
-        if already_enacted: continue
-
-        known_context = {getattr(p, "name", str(p)): bindings[getattr(p, "name", str(p))] 
-                         for p in safe_list(getattr(schema, "ins", [])) 
-                         if getattr(p, "name", str(p)) in bindings}
-        
-        outs_data = []
-        for x in safe_list(getattr(schema, "outs", [])):
-            p = x.param if hasattr(x, 'param') else x
-            x_name = str(getattr(p, 'name', x))
-            x_is_key = bool(getattr(p, 'key', False) or getattr(p, 'is_key', False) or 'key' in str(p).lower().split())
-            if not x_is_key:
-                outs_data.append(x_name)
-            
-        actions.append({
-            "message": schema.name,
-            "ins": [getattr(x, 'name', str(x)) for x in safe_list(getattr(schema, "ins", []))],
-            "outs": outs_data,
-            "known": known_context
+        messages.append({
+            "name":       msg.name,
+            "sender":     str(getattr(msg.sender, "name", msg.sender)),
+            "recipients": [str(getattr(r, "name", r)) for r in safe_list(msg.recipients)],
+            "ins":        ins_list,
+            "outs":       outs_list,
         })
 
-    return {"enactment_id": enactment_id, "bindings": bindings, "peers": record.get("peers", {}), "actions": actions}
+    return {
+        "name":     normalize_name(protocol_name),
+        "roles":    list(proto.roles.keys()),
+        "messages": messages,
+    }
 
-class SendBody(BaseModel):
-    payload: Dict[str, Any]
 
-@app.post("/enactments/{enactment_id}/send/{message_name}")
-async def send_message(enactment_id: str, message_name: str, body: dict, background_tasks: BackgroundTasks, role: Optional[str] = None):
-    if enactment_id not in enactments: raise HTTPException(404, "Enactment not found")
-    record = enactments[enactment_id]
-    protocol_name = record["protocol"]
-    role_name = str(role if role else record.get("role", AGENT_NAME))
-    
-    adapter = await ensure_adapter(protocol_name, role_name)
+# ─────────────────────────────────────────────────────────────────
+# Join a MAS
+# ─────────────────────────────────────────────────────────────────
+@app.post("/api/join")
+async def api_join(body: JoinBody, background_tasks: BackgroundTasks):
+    if body.mas_id in active_agents:
+        raise HTTPException(409, f"Already joined MAS '{body.mas_id}' in this session")
+    await _do_join(body)
+    background_tasks.add_task(StateManager.save)
+    return {
+        "status":        "joined",
+        "mas_id":        body.mas_id,
+        "role":          body.role,
+        "dashboard_url": f"/{AGENT_ID}/dashboard",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Inbound peer message webhook
+# ─────────────────────────────────────────────────────────────────
+@app.post("/{agent_id}/messages")
+async def receive_message(agent_id: str, request: Request, background_tasks: BackgroundTasks, mas_id: Optional[str] = None):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent")
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    schema_key = data.get("schema", "")
+    target_slot: Optional[dict] = None
+
+    # Precise routing if the sender provided the MAS ID in the webhook URL
+    if mas_id and mas_id in active_agents:
+        slot = active_agents[mas_id]
+        if schema_key in slot["adapter"].messages:
+            target_slot = slot
+
+    # Fallback to scanning all sessions if no/invalid MAS ID provided
+    if target_slot is None:
+        for slot in active_agents.values():
+            if schema_key in slot["adapter"].messages:
+                target_slot = slot
+                break
+
+    if target_slot is None:
+        raise HTTPException(404, f"No active adapter handles schema '{schema_key}'")
+
+    # ── Invitation model ─────────────────────────────────────────────
+    # If this message carries an enactment ID we don't know about,
+    # auto-create the record so the receiver's dashboard shows it
+    # without requiring a manual "Start Enactment" click.
+    inbound_eid = data.get("meta", {}).get("enactment")
+    inbound_payload = data.get("payload", {})
+    if inbound_eid:
+        enactments = target_slot["enactments"]
+        if inbound_eid not in enactments:
+            cfg = target_slot["config"]
+            enactments[inbound_eid] = {
+                "protocol": cfg["protocol_name"],
+                "role":     cfg["role"],
+                "bindings": dict(inbound_payload),
+            }
+            logger.info(
+                f"[Invitation] Auto-created enactment '{inbound_eid}' "
+                f"in MAS '{cfg['mas_id']}' (triggered by incoming {schema_key})"
+            )
+            background_tasks.add_task(StateManager.save)
+
+    await target_slot["adapter"].receive(data)
+    background_tasks.add_task(StateManager.save)
+    return {"status": "ok"}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Start a protocol enactment
+# ─────────────────────────────────────────────────────────────────
+class EnactmentBody(BaseModel):
+    enactment_id: Optional[str] = None
+    bindings:     Dict[str, Any] = {}
+
+
+@app.post("/{agent_id}/enactments")
+async def start_enactment(
+    agent_id: str,
+    body: EnactmentBody,
+    background_tasks: BackgroundTasks,
+    mas_id: str = Query(..., description="Which MAS session to enact under"),
+):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent")
+    if mas_id not in active_agents:
+        raise HTTPException(404, f"Not joined MAS '{mas_id}'")
+
+    slot = active_agents[mas_id]
+    eid  = (body.enactment_id or "").strip() or str(uuid.uuid4())
+
+    if eid in slot["enactments"]:
+        return {
+            "enactment_id": eid,
+            "mas_id":       mas_id,
+            "role":         slot["config"]["role"],
+            "status":       "already_exists",
+        }
+
+    slot["enactments"][eid] = {
+        "protocol": slot["config"]["protocol_name"],
+        "role":     slot["config"]["role"],
+        "bindings": dict(body.bindings),
+    }
+    background_tasks.add_task(StateManager.save)
+    return {
+        "enactment_id": eid,
+        "mas_id":       mas_id,
+        "role":         slot["config"]["role"],
+        "status":       "created",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Get enabled actions for an enactment
+# ─────────────────────────────────────────────────────────────────
+@app.get("/{agent_id}/enactments/{enactment_id}/actions")
+async def get_actions(
+    agent_id:     str,
+    enactment_id: str,
+    mas_id:       str = Query(...),
+):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent")
+    if mas_id not in active_agents:
+        raise HTTPException(404, f"Not joined MAS '{mas_id}'")
+
+    slot = active_agents[mas_id]
+    adapter = slot["adapter"]
+    enactments = slot["enactments"]
+
+    if enactment_id not in enactments:
+        raise HTTPException(404, "Enactment not found")
+
+    record   = enactments[enactment_id]
+    bindings = record["bindings"]
+    updated  = False
+
+    proto = None
+    protocol_keys = set()
+    try:
+        proto, _ = load_protocol(slot["config"]["protocol_name"])
+        if hasattr(proto, "public_parameters"):
+            for p_name, param_obj in proto.public_parameters.items():
+                if getattr(param_obj, "key", None) == "key":
+                    protocol_keys.add(p_name.strip())
+    except Exception:
+        pass
+
+    # ── 1. Sync bindings from history ──────────────────────────────
+    for m in list(adapter.history.messages()):
+        raw_payload = getattr(m, "payload", {}) or {}
+        payload = {str(getattr(k, "name", k)).strip(): v for k, v in raw_payload.items()}
+        meta    = getattr(m, "meta", {}) or {}
+
+        is_mine = meta.get("enactment") == enactment_id
+        if not is_mine and payload:
+            if enactment_id in payload.values():
+                is_mine = True
+            elif bindings and protocol_keys:
+                shared = set(payload.keys()) & set(bindings.keys()) & protocol_keys
+                if shared and all(payload[k] == bindings[k] for k in shared):
+                    is_mine = True
+
+        if is_mine:
+            msg_schema  = getattr(m, "schema", None)
+            valid_params = set()
+            if msg_schema:
+                for ref in safe_list(getattr(msg_schema, "ins", [])) + safe_list(getattr(msg_schema, "outs", [])):
+                    p = ref.param if hasattr(ref, "param") else ref
+                    valid_params.add(str(getattr(p, "name", p)).strip())
+            for k, v in payload.items():
+                if valid_params and k not in valid_params:
+                    continue
+                if k not in bindings or bindings[k] != v:
+                    bindings[k] = v
+                    updated = True
+
+    if updated:
+        StateManager.save()
+
+    # ── 2. Build actions from enabled_messages ──────────────────────
+    actions = []
+    for m in adapter.enabled_messages.messages():
+        schema = getattr(m, "schema", m)
+
+        # Causality cull — skip if already sent in this enactment
+        already_enacted = False
+        for hm in adapter.history.messages():
+            h_schema  = getattr(hm, "schema", None)
+            h_payload = {str(getattr(k, "name", k)).strip(): v for k, v in (getattr(hm, "payload", {}) or {}).items()}
+            h_meta    = getattr(hm, "meta", {}) or {}
+            h_mine = h_meta.get("enactment") == enactment_id
+            if not h_mine and h_payload:
+                if enactment_id in h_payload.values():
+                    h_mine = True
+                elif bindings and protocol_keys:
+                    sc = set(h_payload.keys()) & set(bindings.keys()) & protocol_keys
+                    if sc and all(h_payload[k] == bindings[k] for k in sc):
+                        h_mine = True
+            if h_schema == schema and h_mine:
+                already_enacted = True
+                break
+        if already_enacted:
+            continue
+
+        known_ins = {
+            getattr(p, "name", str(p)): bindings[getattr(p, "name", str(p))]
+            for p in safe_list(getattr(schema, "ins", []))
+            if getattr(p, "name", str(p)) in bindings
+        }
+
+        outs_data = []
+        for x in safe_list(getattr(schema, "outs", [])):
+            p      = x.param if hasattr(x, "param") else x
+            p_name = str(getattr(p, "name", x)).strip()
+            is_key = p_name in protocol_keys
+            outs_data.append({"name": p_name, "is_key": is_key})
+
+        actions.append({
+            "message":    schema.name,
+            "sender":     str(getattr(schema.sender, "name", schema.sender)),
+            "recipients": [str(getattr(r, "name", r)) for r in safe_list(schema.recipients)],
+            "ins":        [getattr(x, "name", str(x)) for x in safe_list(getattr(schema, "ins", []))],
+            "outs":       outs_data,
+            "known":      known_ins,
+        })
+
+    return {
+        "enactment_id": enactment_id,
+        "mas_id":       mas_id,
+        "role":         record["role"],
+        "bindings":     bindings,
+        "actions":      actions,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Send a message
+# ─────────────────────────────────────────────────────────────────
+@app.post("/{agent_id}/enactments/{enactment_id}/send/{message_name}")
+async def send_message(
+    agent_id:     str,
+    enactment_id: str,
+    message_name: str,
+    request:      Request,
+    background_tasks: BackgroundTasks,
+    mas_id:       str = Query(...),
+):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent")
+    if mas_id not in active_agents:
+        raise HTTPException(404, f"Not joined MAS '{mas_id}'")
+
+    slot = active_agents[mas_id]
+    adapter    = slot["adapter"]
+    enactments = slot["enactments"]
+    topology   = slot["config"]["topology"]
+
+    if enactment_id not in enactments:
+        raise HTTPException(404, "Enactment not found")
+
+    record   = enactments[enactment_id]
     bindings = record["bindings"]
 
-    schema = next((getattr(m, "schema", m) for m in adapter.enabled_messages.messages() if getattr(m, "schema", m).name == message_name), None)
-    if not schema: raise HTTPException(400, f"Message {message_name} not enabled or already sent")
-
+    body        = await request.json()
     req_payload = body.get("payload", {})
 
-    # 1. Inject Enactment ID for missing keys
-    for ref in safe_list(getattr(schema, 'outs', [])):
-        p = ref.param if hasattr(ref, 'param') else ref
-        ref_name = str(getattr(p, 'name', ref))
-        is_key = bool(getattr(p, 'key', False) or getattr(p, 'is_key', False) or 'key' in str(p).lower().split())
-        
-        if is_key and ref_name not in req_payload and ref_name not in bindings:
-            req_payload[ref_name] = enactment_id
+    # Find schema in enabled messages
+    schema = next(
+        (getattr(m, "schema", m) for m in adapter.enabled_messages.messages()
+         if getattr(m, "schema", m).name == message_name),
+        None,
+    )
+    if schema is None:
+        raise HTTPException(400, f"Message '{message_name}' is not currently enabled")
+
+    proto = None
+    try:
+        proto, _ = load_protocol(slot["config"]["protocol_name"])
+    except Exception:
+        pass
+
+    # Auto-inject key parameters (use enactment_id as value if not supplied)
+    for ref in safe_list(getattr(schema, "outs", [])):
+        p       = ref.param if hasattr(ref, "param") else ref
+        p_name  = str(getattr(p, "name", ref)).strip()
+        is_key  = False
+        if proto and hasattr(proto, "public_parameters"):
+            param_obj = proto.public_parameters.get(p_name)
+            is_key = (param_obj and getattr(param_obj, "key", None) == "key")
+        if is_key and p_name not in req_payload and p_name not in bindings:
+            req_payload[p_name] = enactment_id
 
     final_payload = {**bindings, **req_payload}
 
-    # --- PRIVACY ENFORCEMENT FILTER ---
-    # Deduce the exact parameters permitted by the BSPL schema
-    valid_schema_params = set()
-    for p in safe_list(getattr(schema, 'ins', [])) + safe_list(getattr(schema, 'outs', [])):
-        param_obj = p.param if hasattr(p, 'param') else p
-        valid_schema_params.add(str(getattr(param_obj, 'name', param_obj)).strip())
+    # Privacy filter — only params the schema permits
+    valid_params: set = set()
+    for ref in safe_list(getattr(schema, "ins", [])) + safe_list(getattr(schema, "outs", [])):
+        p = ref.param if hasattr(ref, "param") else ref
+        valid_params.add(str(getattr(p, "name", p)).strip())
+    filtered = {k: v for k, v in final_payload.items() if k in valid_params}
 
-    # Isolate the payload to only transmit authorized knowledge
-    filtered_payload = {k: v for k, v in final_payload.items() if k in valid_schema_params}
-    to_send = []
+    # Build messages to send
+    to_send: List[Message] = []
     recipients = safe_list(schema.recipients)
-    
-    # 2. Universal Deterministic Routing Matrix
-    # 2. Universal Deterministic Routing Matrix (Pure Environment Variable Parsing)
     if not recipients:
-        to_send.append(Message(schema, filtered_payload, meta={"enactment": enactment_id}, adapter=adapter, system="default"))
+        to_send.append(Message(schema, filtered, meta={"enactment": enactment_id}, adapter=adapter, system="default"))
     else:
         for recip_role in recipients:
-            r_name = str(getattr(recip_role, 'name', recip_role)).strip()
-            
-            # Pure dynamic parsing from the environment injected by the Launcher
-            base_str = os.getenv("BASE_URLS", "")
-            dynamic_urls = {}
-            for pair in base_str.split(","):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    parsed = urlparse(v.strip())
-                    dynamic_urls[k.strip()] = (parsed.hostname or "127.0.0.1", parsed.port or 80)
-            
-            if r_name in dynamic_urls:
-                dest_url = dynamic_urls[r_name]
+            r_name = str(getattr(recip_role, "name", recip_role)).strip()
+            if r_name in topology:
+                parsed = urlparse(topology[r_name])
+                dest   = (parsed.hostname or "127.0.0.1", parsed.port or 80)
             else:
-                # If strictly not found in environment topology, fallback to self (Receiver Port)
-                dest_url = ("127.0.0.1", RECEIVER_PORT)
-                
-            to_send.append(Message(schema, filtered_payload, meta={"enactment": enactment_id}, dest=dest_url, adapter=adapter, system="default"))
+                dest = ("127.0.0.1", API_PORT)
+            to_send.append(Message(schema, filtered, meta={"enactment": enactment_id}, dest=dest, adapter=adapter, system="default"))
 
     try:
-        new_messages, retry_messages = [], []
-        for m in to_send:
-            if adapter.history.context(m).find(m.schema): retry_messages.append(m)
-            else: new_messages.append(m)
+        new_msgs   = [m for m in to_send if not adapter.history.context(m).find(m.schema)]
+        retry_msgs = [m for m in to_send if     adapter.history.context(m).find(m.schema)]
 
-        if new_messages:
-            await adapter.send(*new_messages)
-            record["bindings"].update(final_payload)
+        if new_msgs:
+            await adapter.send(*new_msgs)
+            record["bindings"].update(filtered)
             background_tasks.add_task(StateManager.save)
 
-        for m in retry_messages: await adapter.emitter.send(m)
-        return {"status": "sent", "payload": final_payload}
+        for m in retry_msgs:
+            await adapter.emitter.send(m)
+
+        return {"status": "sent", "payload": filtered}
     except Exception as e:
-        raise HTTPException(400, f"System Error: {str(e)}")
-    
+        raise HTTPException(400, f"Send failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Knowledge base — full history grouped by enactment key
+# ─────────────────────────────────────────────────────────────────
+@app.get("/{agent_id}/knowledge_base")
+def get_knowledge_base(agent_id: str):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent")
+
+    result: Dict[str, dict] = {}
+    for mas_id, slot in active_agents.items():
+        adapter    = slot["adapter"]
+        proto_name = slot["config"]["protocol_name"]
+        try:
+            proto, _ = load_protocol(proto_name)
+        except Exception:
+            continue
+
+        # Collect key parameter names from the protocol
+        key_params: set = set()
+        if hasattr(proto, "public_parameters"):
+            for p_name, param_obj in proto.public_parameters.items():
+                if getattr(param_obj, "key", None) == "key":
+                    key_params.add(p_name.strip())
+
+        # Group history by enactment key value
+        groups: Dict[str, list] = {}
+        for m in adapter.history.messages():
+            raw = {str(getattr(k, "name", k)).strip(): v for k, v in (getattr(m, "payload", {}) or {}).items()}
+            key_val = next((raw[kp] for kp in key_params if kp in raw), "unkeyed")
+            groups.setdefault(key_val, []).append({
+                "message": getattr(getattr(m, "schema", None), "name", "?"),
+                "payload": raw,
+                "meta":    {k: str(v) for k, v in (getattr(m, "meta", {}) or {}).items()},
+            })
+
+        result[mas_id] = {
+            "protocol":   proto_name,
+            "role":       slot["config"]["role"],
+            "enactments": groups,
+            "key_params": list(key_params),
+        }
+
+    return {"agent_id": AGENT_ID, "knowledge_base": result}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=API_PORT, reload=False)

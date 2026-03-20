@@ -1,0 +1,15 @@
+{
+  "testseller": "35149677-7c47-4d69-93c0-b254d8774b8a",
+  "testbuyer": "1df3838c-692f-4dd4-8302-c9a16ffd1b37",
+  "testshipper": "c02de1fc-d5af-4d86-879b-b2dfeca223ca",
+  "testmerchant": "6135e117-65ee-4b83-8449-12b5c56d13ee",
+  "testlabeler": "6ee4fc1e-8772-41d4-9b70-a9e77b1fa10c",
+  "testwrapper": "2c1c30f4-53b8-4ff8-88d5-a81acb0f4c74",
+  "testpacker": "e845f386-89e0-45b5-9b03-83f5b1f22413",
+  "testauctioneer": "6b1264e2-2601-4d7d-9448-817c09c6be3e",
+  "testbidder": "9800f22d-ab10-4d11-b62f-31ad467f4f52",
+  "testapi": "504dee90-8a5f-4a97-9bd8-12dab17382e2",
+  "bob": "cf4579c0-01d0-41c6-858d-f071d0c2256d",
+  "alice": "92c76239-630d-40cc-81bf-efc64d24deeb",
+  "jack": "4aca1e93-356d-4226-8513-9c92304145ca"
+}

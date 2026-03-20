@@ -1,0 +1,9 @@
+Auction {
+  roles Auctioneer, Bidder
+  parameters out auctionID key, out winner
+  private item, bidID, amount
+
+  Auctioneer -> Bidder: Open[out auctionID, out item]
+  Bidder -> Auctioneer: Bid[in auctionID, out bidID key, out amount]
+  Auctioneer -> Bidder: Award[in auctionID, in bidID, out winner]
+}

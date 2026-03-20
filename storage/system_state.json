@@ -1,0 +1,742 @@
+{
+  "1df3838c-692f-4dd4-8302-c9a16ffd1b37": {
+    "p-mas": {
+      "config": {
+        "mas_id": "p-mas",
+        "protocol_name": "Purchase",
+        "role": "Buyer",
+        "topology": {
+          "Seller": "http://127.0.0.1:8012/35149677-7c47-4d69-93c0-b254d8774b8a",
+          "Shipper": "http://127.0.0.1:8013/c02de1fc-d5af-4d86-879b-b2dfeca223ca"
+        }
+      },
+      "enactments": {
+        "p-e1": {
+          "protocol": "Purchase",
+          "role": "Buyer",
+          "bindings": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "price": "999",
+            "resp": "yes",
+            "address": "Lancaster, UK"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Purchase/rfq",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/quote",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "price": "999"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1",
+            "received": "2026-03-20 01:21:28.626357"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/accept",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "price": "999",
+            "resp": "yes",
+            "address": "Lancaster, UK"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/deliver",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "address": "Lancaster, UK",
+            "outcome": "delivered"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1",
+            "received": "2026-03-20 01:21:28.829217"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "35149677-7c47-4d69-93c0-b254d8774b8a": {
+    "p-mas": {
+      "config": {
+        "mas_id": "p-mas",
+        "protocol_name": "Purchase",
+        "role": "Seller",
+        "topology": {
+          "Buyer": "http://127.0.0.1:8011/1df3838c-692f-4dd4-8302-c9a16ffd1b37",
+          "Shipper": "http://127.0.0.1:8013/c02de1fc-d5af-4d86-879b-b2dfeca223ca"
+        }
+      },
+      "enactments": {
+        "p-e1": {
+          "protocol": "Purchase",
+          "role": "Seller",
+          "bindings": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "price": "999",
+            "resp": "yes",
+            "address": "Lancaster, UK",
+            "shipped": "dispatched"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Purchase/rfq",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1",
+            "received": "2026-03-20 01:21:28.546647"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/quote",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "price": "999"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/accept",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "price": "999",
+            "resp": "yes",
+            "address": "Lancaster, UK"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1",
+            "received": "2026-03-20 01:21:28.694476"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/ship",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "address": "Lancaster, UK",
+            "shipped": "dispatched"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "c02de1fc-d5af-4d86-879b-b2dfeca223ca": {
+    "p-mas": {
+      "config": {
+        "mas_id": "p-mas",
+        "protocol_name": "Purchase",
+        "role": "Shipper",
+        "topology": {
+          "Buyer": "http://127.0.0.1:8011/1df3838c-692f-4dd4-8302-c9a16ffd1b37",
+          "Seller": "http://127.0.0.1:8012/35149677-7c47-4d69-93c0-b254d8774b8a"
+        }
+      },
+      "enactments": {
+        "p-e1": {
+          "protocol": "Purchase",
+          "role": "Shipper",
+          "bindings": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "address": "Lancaster, UK",
+            "shipped": "dispatched",
+            "outcome": "delivered"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Purchase/ship",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "address": "Lancaster, UK",
+            "shipped": "dispatched"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1",
+            "received": "2026-03-20 01:21:28.749098"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/deliver",
+          "payload": {
+            "item": "Laptop Pro",
+            "ID": "42",
+            "address": "Lancaster, UK",
+            "outcome": "delivered"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "p-e1"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "6135e117-65ee-4b83-8449-12b5c56d13ee": {
+    "log-mas": {
+      "config": {
+        "mas_id": "log-mas",
+        "protocol_name": "Logistics",
+        "role": "Merchant",
+        "topology": {
+          "Labeler": "http://127.0.0.1:8022/6ee4fc1e-8772-41d4-9b70-a9e77b1fa10c",
+          "Wrapper": "http://127.0.0.1:8023/2c1c30f4-53b8-4ff8-88d5-a81acb0f4c74",
+          "Packer": "http://127.0.0.1:8024/e845f386-89e0-45b5-9b03-83f5b1f22413"
+        }
+      },
+      "enactments": {
+        "log-e1": {
+          "protocol": "Logistics",
+          "role": "Merchant",
+          "bindings": {
+            "orderID": "ord-99",
+            "address": "London",
+            "itemID": "i-7",
+            "item": "Crystal Vase"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Logistics/RequestLabel",
+          "payload": {
+            "orderID": "ord-99",
+            "address": "London"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Logistics/RequestWrapping",
+          "payload": {
+            "orderID": "ord-99",
+            "itemID": "i-7",
+            "item": "Crystal Vase"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Logistics/Packed",
+          "payload": {
+            "orderID": "ord-99",
+            "label": "FRAGILE-001",
+            "itemID": "i-7",
+            "item": "Crystal Vase",
+            "wrapping": "bubble-wrap",
+            "status": "ready"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1",
+            "received": "2026-03-20 01:21:35.309857"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "6ee4fc1e-8772-41d4-9b70-a9e77b1fa10c": {
+    "log-mas": {
+      "config": {
+        "mas_id": "log-mas",
+        "protocol_name": "Logistics",
+        "role": "Labeler",
+        "topology": {
+          "Merchant": "http://127.0.0.1:8021/6135e117-65ee-4b83-8449-12b5c56d13ee",
+          "Wrapper": "http://127.0.0.1:8023/2c1c30f4-53b8-4ff8-88d5-a81acb0f4c74",
+          "Packer": "http://127.0.0.1:8024/e845f386-89e0-45b5-9b03-83f5b1f22413"
+        }
+      },
+      "enactments": {
+        "log-e1": {
+          "protocol": "Logistics",
+          "role": "Labeler",
+          "bindings": {
+            "orderID": "ord-99",
+            "address": "London",
+            "label": "FRAGILE-001"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Logistics/RequestLabel",
+          "payload": {
+            "orderID": "ord-99",
+            "address": "London"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1",
+            "received": "2026-03-20 01:21:34.989625"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Logistics/Labeled",
+          "payload": {
+            "orderID": "ord-99",
+            "address": "London",
+            "label": "FRAGILE-001"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "2c1c30f4-53b8-4ff8-88d5-a81acb0f4c74": {
+    "log-mas": {
+      "config": {
+        "mas_id": "log-mas",
+        "protocol_name": "Logistics",
+        "role": "Wrapper",
+        "topology": {
+          "Merchant": "http://127.0.0.1:8021/6135e117-65ee-4b83-8449-12b5c56d13ee",
+          "Labeler": "http://127.0.0.1:8022/6ee4fc1e-8772-41d4-9b70-a9e77b1fa10c",
+          "Packer": "http://127.0.0.1:8024/e845f386-89e0-45b5-9b03-83f5b1f22413"
+        }
+      },
+      "enactments": {
+        "log-e1": {
+          "protocol": "Logistics",
+          "role": "Wrapper",
+          "bindings": {
+            "orderID": "ord-99",
+            "itemID": "i-7",
+            "item": "Crystal Vase",
+            "wrapping": "bubble-wrap"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Logistics/RequestWrapping",
+          "payload": {
+            "orderID": "ord-99",
+            "itemID": "i-7",
+            "item": "Crystal Vase"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1",
+            "received": "2026-03-20 01:21:35.050001"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Logistics/Wrapped",
+          "payload": {
+            "orderID": "ord-99",
+            "itemID": "i-7",
+            "item": "Crystal Vase",
+            "wrapping": "bubble-wrap"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "e845f386-89e0-45b5-9b03-83f5b1f22413": {
+    "log-mas": {
+      "config": {
+        "mas_id": "log-mas",
+        "protocol_name": "Logistics",
+        "role": "Packer",
+        "topology": {
+          "Merchant": "http://127.0.0.1:8021/6135e117-65ee-4b83-8449-12b5c56d13ee",
+          "Labeler": "http://127.0.0.1:8022/6ee4fc1e-8772-41d4-9b70-a9e77b1fa10c",
+          "Wrapper": "http://127.0.0.1:8023/2c1c30f4-53b8-4ff8-88d5-a81acb0f4c74"
+        }
+      },
+      "enactments": {
+        "log-e1": {
+          "protocol": "Logistics",
+          "role": "Packer",
+          "bindings": {
+            "orderID": "ord-99",
+            "address": "London",
+            "label": "FRAGILE-001",
+            "itemID": "i-7",
+            "item": "Crystal Vase",
+            "wrapping": "bubble-wrap",
+            "status": "ready"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Logistics/Labeled",
+          "payload": {
+            "orderID": "ord-99",
+            "address": "London",
+            "label": "FRAGILE-001"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1",
+            "received": "2026-03-20 01:21:35.142492"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Logistics/Wrapped",
+          "payload": {
+            "orderID": "ord-99",
+            "itemID": "i-7",
+            "item": "Crystal Vase",
+            "wrapping": "bubble-wrap"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1",
+            "received": "2026-03-20 01:21:35.229772"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Logistics/Packed",
+          "payload": {
+            "orderID": "ord-99",
+            "label": "FRAGILE-001",
+            "itemID": "i-7",
+            "item": "Crystal Vase",
+            "wrapping": "bubble-wrap",
+            "status": "ready"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "log-e1"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "6b1264e2-2601-4d7d-9448-817c09c6be3e": {
+    "auct-mas": {
+      "config": {
+        "mas_id": "auct-mas",
+        "protocol_name": "Auction",
+        "role": "Auctioneer",
+        "topology": {
+          "Bidder": "http://127.0.0.1:8032/9800f22d-ab10-4d11-b62f-31ad467f4f52"
+        }
+      },
+      "enactments": {
+        "auct-e1": {
+          "protocol": "Auction",
+          "role": "Auctioneer",
+          "bindings": {
+            "auctionID": "lot-777",
+            "item": "Van Gogh",
+            "bidID": "bid-001",
+            "amount": "1500000",
+            "winner": "TestBidder"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Auction/Open",
+          "payload": {
+            "auctionID": "lot-777",
+            "item": "Van Gogh"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "auct-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Auction/Award",
+          "payload": {
+            "auctionID": "lot-777",
+            "bidID": "bid-001",
+            "winner": "TestBidder"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "auct-e1"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Auction/Bid",
+          "payload": {
+            "auctionID": "lot-777",
+            "bidID": "bid-001",
+            "amount": "1500000"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "auct-e1",
+            "received": "2026-03-20 01:21:40.437715"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "9800f22d-ab10-4d11-b62f-31ad467f4f52": {
+    "auct-mas": {
+      "config": {
+        "mas_id": "auct-mas",
+        "protocol_name": "Auction",
+        "role": "Bidder",
+        "topology": {
+          "Auctioneer": "http://127.0.0.1:8031/6b1264e2-2601-4d7d-9448-817c09c6be3e"
+        }
+      },
+      "enactments": {
+        "auct-e1": {
+          "protocol": "Auction",
+          "role": "Bidder",
+          "bindings": {
+            "auctionID": "lot-777",
+            "item": "Van Gogh",
+            "bidID": "bid-001",
+            "amount": "1500000"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Auction/Open",
+          "payload": {
+            "auctionID": "lot-777",
+            "item": "Van Gogh"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "auct-e1",
+            "received": "2026-03-20 01:21:40.381929"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Auction/Award",
+          "payload": {
+            "auctionID": "lot-777",
+            "bidID": "bid-001",
+            "winner": "TestBidder"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "auct-e1",
+            "received": "2026-03-20 01:21:40.479906"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Auction/Bid",
+          "payload": {
+            "auctionID": "lot-777",
+            "bidID": "bid-001",
+            "amount": "1500000"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "auct-e1"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "504dee90-8a5f-4a97-9bd8-12dab17382e2": {
+    "dup": {
+      "config": {
+        "mas_id": "dup",
+        "protocol_name": "Purchase",
+        "role": "Buyer",
+        "topology": {}
+      },
+      "enactments": {},
+      "history": []
+    }
+  },
+  "92c76239-630d-40cc-81bf-efc64d24deeb": {
+    "ui-mas": {
+      "config": {
+        "mas_id": "ui-mas",
+        "protocol_name": "Purchase",
+        "role": "Buyer",
+        "topology": {
+          "Seller": "http://127.0.0.1:8092/cf4579c0-01d0-41c6-858d-f071d0c2256d"
+        }
+      },
+      "enactments": {
+        "order-test": {
+          "protocol": "Purchase",
+          "role": "Buyer",
+          "bindings": {
+            "item": "Test Laptop",
+            "ID": "42"
+          }
+        },
+        "85de0fb9-3806-47be-97bc-92a4a54051f5": {
+          "protocol": "Purchase",
+          "role": "Buyer",
+          "bindings": {}
+        },
+        "8ca13b22-044e-468d-814c-d4cafa2a6d0c": {
+          "protocol": "Purchase",
+          "role": "Buyer",
+          "bindings": {
+            "item": "Laptop",
+            "ID": "8ca13b22-044e-468d-814c-d4cafa2a6d0c",
+            "price": "100"
+          }
+        },
+        "ee5e75fe-7f10-4fab-8082-612b64a2a85d": {
+          "protocol": "Purchase",
+          "role": "Buyer",
+          "bindings": {
+            "item": "Ice Cream",
+            "ID": "ee5e75fe-7f10-4fab-8082-612b64a2a85d"
+          }
+        },
+        "473afc5c-f5ac-4aab-911d-6a9c35868aaa": {
+          "protocol": "Purchase",
+          "role": "Buyer",
+          "bindings": {
+            "item": "Book",
+            "ID": "473afc5c-f5ac-4aab-911d-6a9c35868aaa"
+          }
+        }
+      },
+      "history": [
+        {
+          "schema": "Purchase/rfq",
+          "payload": {
+            "item": "Ice Cream",
+            "ID": "ee5e75fe-7f10-4fab-8082-612b64a2a85d"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "ee5e75fe-7f10-4fab-8082-612b64a2a85d"
+          },
+          "system": "default"
+        },
+        {
+          "schema": "Purchase/rfq",
+          "payload": {
+            "item": "Book",
+            "ID": "473afc5c-f5ac-4aab-911d-6a9c35868aaa"
+          },
+          "meta": {
+            "system": "default",
+            "enactment": "473afc5c-f5ac-4aab-911d-6a9c35868aaa"
+          },
+          "system": "default"
+        }
+      ]
+    }
+  },
+  "cf4579c0-01d0-41c6-858d-f071d0c2256d": {
+    "ui-mas": {
+      "config": {
+        "mas_id": "ui-mas",
+        "protocol_name": "Purchase",
+        "role": "Seller",
+        "topology": {
+          "Buyer": "http://127.0.0.1:8091/92c76239-630d-40cc-81bf-efc64d24deeb"
+        }
+      },
+      "enactments": {
+        "order-test": {
+          "protocol": "Purchase",
+          "role": "Seller",
+          "bindings": {
+            "item": "Test Laptop",
+            "ID": "42"
+          }
+        },
+        "8ca13b22-044e-468d-814c-d4cafa2a6d0c": {
+          "protocol": "Purchase",
+          "role": "Seller",
+          "bindings": {
+            "item": "Laptop",
+            "ID": "8ca13b22-044e-468d-814c-d4cafa2a6d0c",
+            "price": "100"
+          }
+        },
+        "182bc360-fdbc-4847-a8d9-21698ad6ae6a": {
+          "protocol": "Purchase",
+          "role": "Seller",
+          "bindings": {}
+        }
+      },
+      "history": []
+    }
+  }
+}
