@@ -953,6 +953,15 @@
 
   async function sendMessage(msgName) {
     const box = document.getElementById(`action-${msgName}`);
+    const btn = box ? box.querySelector('button') : null;
+    // Guard against double-clicks: disable the button until the request resolves
+    if (btn && btn.disabled) return;
+    if (btn) {
+      btn.disabled = true;
+      btn.dataset.origText = btn.textContent;
+      btn.textContent = 'Sending…';
+    }
+
     const payload = {};
     box.querySelectorAll('input[data-param]').forEach(inp => {
       if (inp.value.trim()) payload[inp.dataset.param] = inp.value.trim();
@@ -968,10 +977,15 @@
         lastActionsHash = '';
         refreshActions();
         refreshKnowledgeBase();
+        // Action box will be re-rendered by refreshActions(); no need to re-enable.
       } else {
         toast(typeof data.detail === 'object' ? JSON.stringify(data.detail) : data.detail, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = btn.dataset.origText || `Send ${msgName}`; }
       }
-    } catch(e) { toast('Network error: ' + e, 'error'); }
+    } catch(e) {
+      toast('Network error: ' + e, 'error');
+      if (btn) { btn.disabled = false; btn.textContent = btn.dataset.origText || `Send ${msgName}`; }
+    }
   }
 
   // ── Knowledge Base ─────────────────────────────────────────────────
