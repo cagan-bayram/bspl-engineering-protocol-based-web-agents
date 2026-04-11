@@ -1,0 +1,19 @@
+Treatment {
+  roles Patient, Doctor, Pharmacist
+  parameters out sID key, out symptom, out done
+  private Rx, rcID, rrID, rpID, rfID, cpID, fpID, rfpID
+
+  Patient -> Doctor: Complaint[out sID key, out symptom]
+  Patient -> Doctor: RetryComplaint[in sID key, in symptom, out rcID key]
+
+  Doctor -> Patient: Reassurance[in sID key, in symptom, nil Rx, out done]
+  Doctor -> Patient: RetryReassurance[in sID key, in symptom, nil Rx, in done, out rrID key]
+
+  Doctor -> Pharmacist: Prescription[in sID key, in symptom, nil done, out Rx]
+  Doctor -> Pharmacist: RetryPrescription[in sID key, in symptom, in Rx, out rpID key]
+  Doctor -> Patient: Copy[in sID key, in Rx, out cpID key]
+  Patient -> Pharmacist: ForwardPrescription[in sID key, in Rx, out fpID key]
+
+  Pharmacist -> Patient: FilledRx[in sID key, in Rx, out done]
+  Pharmacist -> Patient: RetryFilledRx[in sID key, in Rx, in done, out rfID key]
+}
