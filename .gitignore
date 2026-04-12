@@ -5,3 +5,4 @@ __pycache__/
 # Per-agent runtime state — recreated locally on first run, kept out of git
 # so persistence can be demonstrated freshly during viva.
 storage/state_*.json
+storage/discover_*.json

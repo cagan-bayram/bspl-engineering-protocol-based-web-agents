@@ -34,7 +34,8 @@ AGENT_NAME   = os.getenv("AGENT_NAME", "").strip()
 PUBLIC_HOST  = os.getenv("PUBLIC_HOST", "127.0.0.1")
 
 STORAGE_DIR   = Path("storage")
-REGISTRY_FILE = STORAGE_DIR / "agent_registry.json"
+REGISTRY_FILE  = STORAGE_DIR / "agent_registry.json"
+# Per-agent discovery files: storage/discover_{name}.json (race-free)
 # Each agent persists its own state to a per-agent file to avoid race
 # conditions when multiple agent processes write concurrently. The full
 # path is built lazily inside StateManager since AGENT_ID is set at startup.
@@ -176,6 +177,41 @@ def resolve_agent_id(name: str) -> str:
     return registry[key]
 
 
+def _update_discovery():
+    """Write this agent's webhook URL to its own per-agent discovery file (race-free)."""
+    STORAGE_DIR.mkdir(exist_ok=True)
+    webhook = f"http://{PUBLIC_HOST}:{API_PORT}/{AGENT_ID}"
+    f = STORAGE_DIR / f"discover_{AGENT_NAME.strip().lower()}.json"
+    f.write_text(json.dumps({"url": webhook}))
+    logger.info(f"Discovery updated: {AGENT_NAME} → {webhook}")
+
+
+def _read_discovery() -> Dict[str, str]:
+    """Aggregate all per-agent discovery files → {name: webhook_url}."""
+    result: Dict[str, str] = {}
+    for f in STORAGE_DIR.glob("discover_*.json"):
+        name = f.stem.replace("discover_", "", 1)
+        try:
+            result[name] = json.loads(f.read_text())["url"]
+        except Exception:
+            continue
+    return result
+
+
+def resolve_peer_url(name_or_url: str) -> str:
+    """If *name_or_url* starts with ``http``, return as-is.
+    Otherwise treat it as an agent name and look up via per-agent discovery files."""
+    stripped = name_or_url.strip()
+    if stripped.startswith("http://") or stripped.startswith("https://"):
+        return stripped
+    key = stripped.lower()
+    discovery = _read_discovery()
+    if key not in discovery:
+        known = ", ".join(sorted(discovery.keys())) or "(none)"
+        raise HTTPException(400, f"Unknown agent '{stripped}'. Known: {known}")
+    return discovery[key]
+
+
 # ─────────────────────────────────────────────────────────────────
 # Core join logic (also called by StateManager.load for recovery)
 # ─────────────────────────────────────────────────────────────────
@@ -195,16 +231,12 @@ class JoinBody(BaseModel):
     @field_validator("topology")
     @classmethod
     def _validate_topology(cls, v: Dict[str, str]) -> Dict[str, str]:
-        for role, url in v.items():
+        for role, value in v.items():
             if not role or not role.strip():
-                raise ValueError(f"topology key (role) must not be empty")
-            if not url or not url.strip():
-                raise ValueError(f"topology URL for role '{role}' must not be empty")
-            parsed = urlparse(url.strip())
-            if parsed.scheme not in ("http", "https"):
-                raise ValueError(f"topology URL for role '{role}' must use http(s): got '{url}'")
-            if not parsed.hostname:
-                raise ValueError(f"topology URL for role '{role}' has no host: got '{url}'")
+                raise ValueError("topology key (role) must not be empty")
+            if not value or not value.strip():
+                raise ValueError(f"topology value for role '{role}' must not be empty")
+            # Accept both full URLs and plain agent names (resolved at join time)
         return v
 
 
@@ -215,7 +247,8 @@ async def _do_join(body: JoinBody) -> dict:
 
     proto, _ = load_protocol(body.protocol_name)
     protocol_name = normalize_name(body.protocol_name)
-    topology = body.topology
+    # Resolve agent names to full webhook URLs (URLs pass through unchanged)
+    topology = {role: resolve_peer_url(url) for role, url in body.topology.items()}
 
     # HTTPEmitter — sends to peer base URLs + "/messages?mas_id=..."
     # This ensures the receiver routes the message to the correct MAS session!
@@ -354,8 +387,8 @@ class StateManager:
                 for item in slot_data.get("history", []):
                     try:
                         schema_key = item.get("schema", "")
-                        # qualified_name is "ProtocolName.MessageName"
-                        msg_name = schema_key.split(".")[-1]
+                        # qualified_name is "ProtocolName/MessageName"
+                        msg_name = schema_key.rsplit("/", 1)[-1]
                         schema = proto.messages.get(msg_name)
                         if schema is None:
                             continue
@@ -388,6 +421,8 @@ async def lifespan(app: FastAPI):
         AGENT_ID = str(uuid.uuid4())
         logger.warning("AGENT_NAME not set; node identity is transient this session")
     logger.info(f"Node identity: '{AGENT_NAME}' → {AGENT_ID}  (API on :{API_PORT})")
+    if AGENT_NAME:
+        _update_discovery()
     await StateManager.load()
     yield
     StateManager.save()
@@ -430,6 +465,12 @@ def get_identity():
         "public_host": PUBLIC_HOST,
         "webhook_base": f"http://{PUBLIC_HOST}:{API_PORT}/{AGENT_ID}",
     }
+
+
+@app.get("/api/discover")
+def api_discover():
+    """List all known agents for name-based peer topology."""
+    return {"agents": _read_discovery()}
 
 
 @app.get("/api/agents")
@@ -592,6 +633,10 @@ async def receive_message(agent_id: str, request: Request, background_tasks: Bac
             background_tasks.add_task(StateManager.save)
 
     await target_slot["adapter"].receive(data)
+
+    # Update enactment bindings with newly learned parameters
+    if inbound_eid and inbound_eid in target_slot["enactments"]:
+        target_slot["enactments"][inbound_eid]["bindings"].update(inbound_payload)
 
     # Record receive metric
     metrics = target_slot.setdefault("metrics", _empty_metrics())

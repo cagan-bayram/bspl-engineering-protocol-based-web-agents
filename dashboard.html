@@ -457,9 +457,10 @@
       </div>
 
       <div class="card">
-        <h3>Peer Topology</h3>
-        <p class="sub" style="margin-bottom:14px;">For each other role, provide their node base URL
-          (e.g. <code style="font-family:'JetBrains Mono',monospace;">http://127.0.0.1:8002/{their_uuid}</code>)
+        <h3>Peer Agents</h3>
+        <p class="sub" style="margin-bottom:14px;">For each other role, type the agent name
+          (e.g. <code style="font-family:'JetBrains Mono',monospace;">Alice</code>).
+          Full URLs also accepted.
         </p>
         <div id="topologyBuilder"></div>
       </div>
@@ -733,9 +734,25 @@
       row.className = 'topology-row';
       row.innerHTML = `
         <div class="topology-role">${r}</div>
-        <input type="text" data-role="${r}" placeholder="http://host:port/{their_uuid}">`;
+        <input type="text" data-role="${r}" placeholder="Agent name (e.g. Alice)" list="discoveredAgents">`;
       wrap.appendChild(row);
     });
+    loadDiscoveredAgents();
+  }
+
+  async function loadDiscoveredAgents() {
+    try {
+      const res = await fetch(`${BASE}/api/discover`);
+      const data = await res.json();
+      let dl = document.getElementById('discoveredAgents');
+      if (!dl) { dl = document.createElement('datalist'); dl.id = 'discoveredAgents'; document.body.appendChild(dl); }
+      dl.innerHTML = '';
+      for (const name of Object.keys(data.agents || {})) {
+        const opt = document.createElement('option');
+        opt.value = name.charAt(0).toUpperCase() + name.slice(1);
+        dl.appendChild(opt);
+      }
+    } catch(e) { /* discovery optional */ }
   }
 
   async function submitJoin() {
