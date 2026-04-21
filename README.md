@@ -1,41 +1,33 @@
-# BSPL Web Platform for Protocol-Based Multi-Agent Interaction
+# Sliq — Protocol-Based Multi-Agent Web Platform
 
-This repository contains the implementation of a web-based platform for enacting
-multi-agent interaction protocols specified in **BSPL (Blindingly Simple Protocol Language)**.
-
-BSPL enables correct and consistent communication in distributed systems by defining
-interactions in terms of **information causality and protocol keys**, rather than rigid
-message ordering.
-
-The aim of this project is to demonstrate that protocol-driven interaction models can be
-brought onto the web in a practical and developer-accessible manner, without requiring
-users to understand BSPL syntax or multi-agent theory in depth.
+Sliq is a web platform for enacting multi-agent interaction protocols specified
+in **BSPL (Blindingly Simple Protocol Language)**. Each agent runs as an
+independent FastAPI web server and communicates with peers over HTTP. Protocol
+correctness — including information causality and privacy — is enforced locally
+by each agent using BSPL's formal model.
 
 This project is developed as a **Third-Year Project at Lancaster University**.
 
 ## Motivation
 
-Distributed and multi-agent systems often suffer from communication errors due to
-tight coupling, incorrect message sequencing, or inconsistent information flow.
+Distributed and multi-agent systems often suffer from communication errors due
+to tight coupling, incorrect message sequencing, or inconsistent information
+flow. BSPL addresses these issues by specifying *what information must be known*
+for an interaction to occur, rather than prescribing *when* messages must be
+sent.
 
-BSPL addresses these issues by specifying *what information must be known* for an
-interaction to occur, rather than prescribing *when* messages must be sent.
-
-This project explores how BSPL protocols can be:
-- compiled into web-accessible representations,
-- enacted concurrently using key-based instance separation,
-- exposed through a platform suitable for developers and non-expert users.
+This project explores how BSPL protocols can be enacted on the web in a
+decentralised, peer-to-peer manner — with no central coordinator — and compares
+this architecture against a centralised baseline.
 
 ## What This Project Does
 
-- Parses BSPL protocol specifications
-- Compiles protocols into **role-specific interaction specifications**
-- Supports multiple concurrent protocol enactments using protocol keys
-- Records interaction events in an append-only event store
-- Exposes protocol enactment functionality via a web API
-
-The focus of the system is **communication correctness and interaction structure**,
-not autonomous task execution.
+- Parses BSPL protocol specifications and enforces information causality locally
+- Runs each agent as an independent web server with its own browser dashboard
+- Supports multiple concurrent protocol enactments via protocol key separation
+- Enforces privacy structurally — each agent only sees parameters its role is permitted to know
+- Allows agents to crash and recover via message history replay
+- Provides a centralised comparison system for benchmarking
 
 ## What This Project Does NOT Do
 
@@ -43,40 +35,82 @@ not autonomous task execution.
 - It does not guarantee network reliability or message delivery
 - It does not replace existing agent frameworks or AI agent toolkits
 
-Instead, the platform provides **protocol-driven communication scaffolding**
-that other systems can build upon.
+## Dependencies
 
-## Dependencies and Libraries
-
-BSPL is developed by Singh, Chopra, and Christie and is available at:
+BSPL is developed by Singh, Chopra, and Christie:
 
 - https://github.com/masr/bspl
 - https://github.com/shcv/bspl
 
-This project uses a **forked version** of the BSPL repository:
+This project uses a **forked version**:
 
 - https://github.com/cagan-bayram/bspl
 
-The fork extends the original BSPL implementation with an HTTP transport layer,
-allowing BSPL-based interactions to be enacted over the web.
+The fork extends the original BSPL implementation with an HTTP transport layer.
 
-## Project Status
+## Repository Structure
 
-This repository is under active development.
+```
+agent_api.py            # Core agent: FastAPI server, BSPL adapter, dashboard
+centralized_api.py      # Centralised baseline for benchmarking
+gateway.py              # Optional reverse proxy (single-port routing)
+launcher_ui.py          # Tkinter GUI launcher for agent_api.py
+Sliq.bat                # Windows launcher (opens the GUI)
+dashboard.html          # Single-file browser dashboard (served by agent_api.py)
+requirements.txt        # Python dependencies
+protocols/
+    reference/          # BSPL protocol specification files (9 protocols)
+storage/
+    agent_registry.json # Runtime agent name-to-port registry
+testing/
+    test_comprehensive.py     # End-to-end test suite (Purchase, Logistics, Auction)
+    benchmark.py              # Decentralised vs centralised benchmark
+    benchmark_results.csv     # Results from 10-iteration benchmark run
+    test_gateway.py           # Gateway routing tests
+    setup_ui_test.py          # Helper to launch agents for manual UI testing
+```
 
-Features are introduced incrementally and committed feature-by-feature to reflect
-the design and implementation process of the system.
+## Running the Platform (Windows)
 
-## Structure of the Repository
+### Option 1 — GUI Launcher (recommended)
 
-- `app/`: Core application code for protocol compilation and enactment
-- `frontend/`: Web frontend components
-- `templates/`: HTML templates for rendering web pages
-- `requirements.txt`: Python dependencies
-- `README.md`: This documentation file
-- `LICENSE`: License information
-- `build/`: JSON specifications generated from BSPL protocols
-- `protocols/`: BSPL protocol specification files
+Double-click **`Sliq.bat`** to open the launcher. Set an agent name and port,
+then click Launch. The agent starts and your browser opens its dashboard
+automatically. Repeat for each agent in the protocol.
+
+### Option 2 — Command Line
+
+```bash
+# Create and activate a virtual environment
+python -m venv .venv
+.venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Launch an agent (name and port are required)
+set AGENT_NAME=Alice
+set API_PORT=8001
+python agent_api.py
+```
+
+## Running the Tests
+
+```bash
+python testing/test_comprehensive.py
+```
+
+Runs four test groups: Purchase (3 agents), Logistics (4 agents), Auction
+(2 agents), and API correctness checks.
+
+## Running the Benchmark
+
+```bash
+python testing/benchmark.py
+```
+
+Runs 10 iterations of the Purchase protocol on both the decentralised and
+centralised systems and outputs a comparison table.
 
 ## License
 

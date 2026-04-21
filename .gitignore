@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 .mypy_cache/
 
@@ -6,3 +7,12 @@ __pycache__/
 # so persistence can be demonstrated freshly during viva.
 storage/state_*.json
 storage/discover_*.json
+
+# Local debug and scratch files
+diff_cached.txt
+comp_output.txt
+traceback.txt
+app_report.md
+_avg_/
+testing_clean_ui.py
+testing_debug.py
