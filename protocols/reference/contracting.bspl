@@ -1,0 +1,16 @@
+Contracting {
+  roles Customer, Bidder, Accountant, Expert
+  parameters any contractID key, out bidID key, out spec, out proposal, out closed
+  private acceptance, rejection, req, req2, approval, report
+
+  Customer -> Bidder: Invite[out contractID key, out bidID key, out spec]
+  Bidder -> Customer: Tender[in contractID key, in bidID key, in spec, out proposal]
+
+  Customer -> Accountant: RequestApproval[in contractID key, in bidID key, in spec, in proposal, out req]
+  Accountant -> Customer: Allow[in contractID key, in bidID key, in proposal, in req, out approval]
+  Customer -> Expert: RequestOpinion[in contractID key, in bidID key, in spec, in proposal, out req2]
+  Expert -> Customer: Opine[in contractID key, in bidID key, in req2, in proposal, out report]
+
+  Customer -> Bidder: Accept[in contractID key, in bidID key, in proposal, in approval, in report, out acceptance, out closed]
+  Customer -> Bidder: Reject[in contractID key, in bidID key, in proposal, out rejection, out closed]
+}

@@ -11,5 +11,9 @@
   "testapi": "504dee90-8a5f-4a97-9bd8-12dab17382e2",
   "bob": "cf4579c0-01d0-41c6-858d-f071d0c2256d",
   "alice": "92c76239-630d-40cc-81bf-efc64d24deeb",
-  "jack": "4aca1e93-356d-4226-8513-9c92304145ca"
+  "jack": "4aca1e93-356d-4226-8513-9c92304145ca",
+  "uialice": "09027582-177a-41fa-aee5-02268467c512",
+  "uibob": "7e92c7af-067e-48ac-ae34-4f8ae9acd184",
+  "uicarol": "fa8fa600-fb90-44f3-a549-eaea7456746d",
+  "uidave": "6830f4ba-d043-4dc0-b8ea-862167f7e8de"
 }

@@ -323,10 +323,16 @@ def test_api(port=8041):
     ok("404 on unknown protocol ✓")
 
     join(port, "dup", "Purchase", "Buyer", {})
+    # Idempotent: rejoining the same MAS with the same role is a no-op (200 OK)
     r = requests.post(f"http://127.0.0.1:{port}/api/join",
                       json={"mas_id":"dup","protocol_name":"Purchase","role":"Buyer","topology":{}})
-    assert r.status_code == 409
-    ok("409 on duplicate join ✓")
+    assert r.status_code == 200 and r.json().get("status") == "joined", f"got {r.status_code}: {r.text}"
+    ok("Idempotent rejoin returns 200 ✓")
+    # But rejoining with a different role is a conflict (409)
+    r = requests.post(f"http://127.0.0.1:{port}/api/join",
+                      json={"mas_id":"dup","protocol_name":"Purchase","role":"Seller","topology":{}})
+    assert r.status_code == 409, f"got {r.status_code}: {r.text}"
+    ok("409 on role-conflict rejoin ✓")
 
     r = requests.post(f"http://127.0.0.1:{port}/bad-uuid/messages", json={"schema":"x"})
     assert r.status_code == 404
@@ -340,9 +346,30 @@ def test_api(port=8041):
 
 
 # ═══════════════════════════════════════════════════════════════════
+def reset_storage():
+    """Wipe per-agent state files so tests start from a clean slate.
+    The agent_registry.json is preserved so test agents keep stable UUIDs."""
+    storage = "storage"
+    if os.path.isdir(storage):
+        for f in os.listdir(storage):
+            if f.startswith("state_") and f.endswith(".json"):
+                try:
+                    os.remove(os.path.join(storage, f))
+                except OSError:
+                    pass
+        # Also remove the legacy shared file if it exists
+        legacy = os.path.join(storage, "system_state.json")
+        if os.path.exists(legacy):
+            try:
+                os.remove(legacy)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     print(f"\n{BOLD}Sliq Comprehensive Test Suite{RESET}")
     print("=" * 50)
+    reset_storage()
     test_purchase()
     time.sleep(1)
     test_logistics()

@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 import json
 import logging
 import re
+from collections import deque
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import bspl
 from bspl.adapter.core import Adapter
@@ -31,8 +34,13 @@ AGENT_NAME   = os.getenv("AGENT_NAME", "").strip()
 PUBLIC_HOST  = os.getenv("PUBLIC_HOST", "127.0.0.1")
 
 STORAGE_DIR   = Path("storage")
-REGISTRY_FILE = STORAGE_DIR / "agent_registry.json"
-STATE_FILE    = STORAGE_DIR / "system_state.json"
+REGISTRY_FILE  = STORAGE_DIR / "agent_registry.json"
+# Per-agent discovery files: storage/discover_{name}.json (race-free)
+# Each agent persists its own state to a per-agent file to avoid race
+# conditions when multiple agent processes write concurrently. The full
+# path is built lazily inside StateManager since AGENT_ID is set at startup.
+def _state_file() -> Path:
+    return STORAGE_DIR / f"state_{AGENT_ID}.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 logger = logging.getLogger("sliq")
@@ -65,6 +73,9 @@ class NoOpReceiver:
 # Utility helpers
 # ─────────────────────────────────────────────────────────────────
 def safe_list(x):
+    """Coerce x into a list. Returns [] if x cannot be iterated.
+    Used for tolerant access to BSPL adapter attributes that may be
+    None, missing, or non-iterable depending on protocol shape."""
     try:
         return list(x)
     except Exception:
@@ -75,7 +86,11 @@ def normalize_name(n: str) -> str:
     return (n[0].upper() + n[1:]) if n else n
 
 
+@lru_cache(maxsize=None)
 def load_protocol(protocol_name: str):
+    # .bspl files are static at runtime — caching avoids re-parsing on every
+    # send/receive/actions/metrics call (otherwise it dominates request latency
+    # and distorts the centralized-vs-decentralized benchmark).
     pn = normalize_name(protocol_name)
     path = PROTOCOL_DIR / f"{pn.lower()}.bspl"
     if not path.exists():
@@ -86,6 +101,63 @@ def load_protocol(protocol_name: str):
     return spec.protocols[pn], spec
 
 
+# Cap the per-MAS event log so a long-running benchmark cannot grow it
+# without bound. Aggregates (counts, sums) are tracked separately and
+# remain accurate regardless of this cap.
+_METRICS_LOG_CAP = 1024
+
+
+def _empty_metrics() -> dict:
+    return {
+        "joined_at":         time.time(),
+        "messages_sent":     0,
+        "messages_received": 0,
+        "send_failures":     0,
+        "send_dur_sum_ms":   0.0,
+        "send_dur_max_ms":   0.0,
+        "per_enact":         {},   # eid -> {first_ts, last_ts, sent, received}
+        "sent":              deque(maxlen=_METRICS_LOG_CAP),
+        "received":          deque(maxlen=_METRICS_LOG_CAP),
+    }
+
+
+def _record_send(metrics: dict, *, message: str, enactment: str,
+                 ts: float, duration_ms: float, payload_size: int,
+                 recipients: int) -> None:
+    metrics["messages_sent"] += 1
+    metrics["send_dur_sum_ms"] += duration_ms
+    if duration_ms > metrics["send_dur_max_ms"]:
+        metrics["send_dur_max_ms"] = duration_ms
+    metrics["sent"].append({
+        "message": message, "enactment": enactment, "ts": ts,
+        "duration_ms": duration_ms, "payload_size": payload_size,
+        "recipients": recipients,
+    })
+    if enactment:
+        e = metrics["per_enact"].setdefault(
+            enactment, {"first_ts": ts, "last_ts": ts, "sent": 0, "received": 0}
+        )
+        e["first_ts"] = min(e["first_ts"], ts)
+        e["last_ts"]  = max(e["last_ts"],  ts)
+        e["sent"] += 1
+
+
+def _record_receive(metrics: dict, *, message: str, enactment: str,
+                    ts: float, payload_size: int) -> None:
+    metrics["messages_received"] += 1
+    metrics["received"].append({
+        "message": message, "enactment": enactment, "ts": ts,
+        "payload_size": payload_size,
+    })
+    if enactment:
+        e = metrics["per_enact"].setdefault(
+            enactment, {"first_ts": ts, "last_ts": ts, "sent": 0, "received": 0}
+        )
+        e["first_ts"] = min(e["first_ts"], ts)
+        e["last_ts"]  = max(e["last_ts"],  ts)
+        e["received"] += 1
+
+
 def resolve_agent_id(name: str) -> str:
     """Return persistent UUID for agent name; create it if first use."""
     STORAGE_DIR.mkdir(exist_ok=True)
@@ -93,8 +165,8 @@ def resolve_agent_id(name: str) -> str:
     if REGISTRY_FILE.exists():
         try:
             registry = json.loads(REGISTRY_FILE.read_text())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not parse {REGISTRY_FILE}: {e}. Starting with empty registry.")
     key = name.strip().lower()
     if key not in registry:
         registry[key] = str(uuid.uuid4())
@@ -103,6 +175,41 @@ def resolve_agent_id(name: str) -> str:
     else:
         logger.info(f"Agent '{name}' restored   → {registry[key]}")
     return registry[key]
+
+
+def _update_discovery():
+    """Write this agent's webhook URL to its own per-agent discovery file (race-free)."""
+    STORAGE_DIR.mkdir(exist_ok=True)
+    webhook = f"http://{PUBLIC_HOST}:{API_PORT}/{AGENT_ID}"
+    f = STORAGE_DIR / f"discover_{AGENT_NAME.strip().lower()}.json"
+    f.write_text(json.dumps({"url": webhook}))
+    logger.info(f"Discovery updated: {AGENT_NAME} → {webhook}")
+
+
+def _read_discovery() -> Dict[str, str]:
+    """Aggregate all per-agent discovery files → {name: webhook_url}."""
+    result: Dict[str, str] = {}
+    for f in STORAGE_DIR.glob("discover_*.json"):
+        name = f.stem.replace("discover_", "", 1)
+        try:
+            result[name] = json.loads(f.read_text())["url"]
+        except Exception:
+            continue
+    return result
+
+
+def resolve_peer_url(name_or_url: str) -> str:
+    """If *name_or_url* starts with ``http``, return as-is.
+    Otherwise treat it as an agent name and look up via per-agent discovery files."""
+    stripped = name_or_url.strip()
+    if stripped.startswith("http://") or stripped.startswith("https://"):
+        return stripped
+    key = stripped.lower()
+    discovery = _read_discovery()
+    if key not in discovery:
+        known = ", ".join(sorted(discovery.keys())) or "(none)"
+        raise HTTPException(400, f"Unknown agent '{stripped}'. Known: {known}")
+    return discovery[key]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -114,6 +221,24 @@ class JoinBody(BaseModel):
     role:          str
     topology:      Dict[str, str]   # { other_role: "http://host:port/{their_uuid}" }
 
+    @field_validator("mas_id", "protocol_name", "role")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("must be a non-empty string")
+        return v.strip()
+
+    @field_validator("topology")
+    @classmethod
+    def _validate_topology(cls, v: Dict[str, str]) -> Dict[str, str]:
+        for role, value in v.items():
+            if not role or not role.strip():
+                raise ValueError("topology key (role) must not be empty")
+            if not value or not value.strip():
+                raise ValueError(f"topology value for role '{role}' must not be empty")
+            # Accept both full URLs and plain agent names (resolved at join time)
+        return v
+
 
 async def _do_join(body: JoinBody) -> dict:
     """Create Adapter + register in active_agents. Idempotent."""
@@ -122,7 +247,8 @@ async def _do_join(body: JoinBody) -> dict:
 
     proto, _ = load_protocol(body.protocol_name)
     protocol_name = normalize_name(body.protocol_name)
-    topology = body.topology
+    # Resolve agent names to full webhook URLs (URLs pass through unchanged)
+    topology = {role: resolve_peer_url(url) for role, url in body.topology.items()}
 
     # HTTPEmitter — sends to peer base URLs + "/messages?mas_id=..."
     # This ensures the receiver routes the message to the correct MAS session!
@@ -172,6 +298,9 @@ async def _do_join(body: JoinBody) -> dict:
             "topology":      topology,
         },
         "enactments": {},
+        # Metrics — running counters + bounded event log. Used by the report's
+        # evaluation chapter to compare decentralized vs. centralized.
+        "metrics": _empty_metrics(),
     }
     active_agents[body.mas_id] = slot
     logger.info(f"Joined MAS '{body.mas_id}' as {body.role} in {protocol_name}")
@@ -202,8 +331,8 @@ class StateManager:
                         "meta":    {k: str(v) for k, v in (getattr(msg, "meta", {}) or {}).items()},
                         "system":  getattr(msg, "system", "default"),
                     })
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Could not serialize history message in MAS '{mas_id}': {e}")
 
             data[mas_id] = {
                 "config":     slot["config"],
@@ -211,27 +340,29 @@ class StateManager:
                 "history":    history_items,
             }
 
-        # Merge with any other agents' data already in the file
-        existing: Dict = {}
-        if STATE_FILE.exists():
-            try:
-                existing = json.loads(STATE_FILE.read_text())
-            except Exception:
-                pass
-        existing[AGENT_ID] = data
-
+        # Per-agent file: no merging needed, no race conditions with peers.
         try:
-            STATE_FILE.write_text(json.dumps(existing, indent=2, default=str))
+            _state_file().write_text(json.dumps(data, indent=2, default=str))
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
     @staticmethod
     async def load():
-        if not STATE_FILE.exists():
+        # Migrate from legacy shared file if present (one-time, best-effort).
+        legacy_file = STORAGE_DIR / "system_state.json"
+        if legacy_file.exists() and not _state_file().exists():
+            try:
+                legacy = json.loads(legacy_file.read_text())
+                if isinstance(legacy, dict) and AGENT_ID in legacy:
+                    _state_file().write_text(json.dumps(legacy[AGENT_ID], indent=2, default=str))
+                    logger.info(f"Migrated legacy state for {AGENT_ID} → {_state_file().name}")
+            except Exception as e:
+                logger.warning(f"Legacy state migration failed: {e}")
+
+        if not _state_file().exists():
             return
         try:
-            all_data = json.loads(STATE_FILE.read_text())
-            agent_data: Dict = all_data.get(AGENT_ID, {})
+            agent_data: Dict = json.loads(_state_file().read_text())
 
             for mas_id, slot_data in agent_data.items():
                 cfg = slot_data.get("config", {})
@@ -256,8 +387,8 @@ class StateManager:
                 for item in slot_data.get("history", []):
                     try:
                         schema_key = item.get("schema", "")
-                        # qualified_name is "ProtocolName.MessageName"
-                        msg_name = schema_key.split(".")[-1]
+                        # qualified_name is "ProtocolName/MessageName"
+                        msg_name = schema_key.rsplit("/", 1)[-1]
                         schema = proto.messages.get(msg_name)
                         if schema is None:
                             continue
@@ -269,8 +400,8 @@ class StateManager:
                         )
                         if not adapter.history.context(msg).find(schema):
                             adapter.history.add(msg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Could not replay history item in MAS '{mas_id}': {e}")
 
             logger.info(f"State restored: {len(agent_data)} MAS session(s)")
         except Exception as e:
@@ -290,6 +421,8 @@ async def lifespan(app: FastAPI):
         AGENT_ID = str(uuid.uuid4())
         logger.warning("AGENT_NAME not set; node identity is transient this session")
     logger.info(f"Node identity: '{AGENT_NAME}' → {AGENT_ID}  (API on :{API_PORT})")
+    if AGENT_NAME:
+        _update_discovery()
     await StateManager.load()
     yield
     StateManager.save()
@@ -332,6 +465,12 @@ def get_identity():
         "public_host": PUBLIC_HOST,
         "webhook_base": f"http://{PUBLIC_HOST}:{API_PORT}/{AGENT_ID}",
     }
+
+
+@app.get("/api/discover")
+def api_discover():
+    """List all known agents for name-based peer topology."""
+    return {"agents": _read_discovery()}
 
 
 @app.get("/api/agents")
@@ -413,8 +552,23 @@ def get_protocol_spec(protocol_name: str):
 # ─────────────────────────────────────────────────────────────────
 @app.post("/api/join")
 async def api_join(body: JoinBody, background_tasks: BackgroundTasks):
+    # Idempotent: if the MAS is already joined (e.g. restored from disk),
+    # return success rather than 409. This matches the auto-invitation model:
+    # joining a MAS you're already in should be a no-op, not an error.
     if body.mas_id in active_agents:
-        raise HTTPException(409, f"Already joined MAS '{body.mas_id}' in this session")
+        existing = active_agents[body.mas_id]["config"]
+        if existing["role"] != body.role:
+            raise HTTPException(
+                409,
+                f"Already joined MAS '{body.mas_id}' as '{existing['role']}', cannot rejoin as '{body.role}'",
+            )
+        return {
+            "status":        "joined",
+            "mas_id":        body.mas_id,
+            "role":          body.role,
+            "dashboard_url": f"/{AGENT_ID}/dashboard",
+            "note":          "already in this MAS",
+        }
     await _do_join(body)
     background_tasks.add_task(StateManager.save)
     return {
@@ -479,6 +633,22 @@ async def receive_message(agent_id: str, request: Request, background_tasks: Bac
             background_tasks.add_task(StateManager.save)
 
     await target_slot["adapter"].receive(data)
+
+    # Update enactment bindings with newly learned parameters
+    if inbound_eid and inbound_eid in target_slot["enactments"]:
+        target_slot["enactments"][inbound_eid]["bindings"].update(inbound_payload)
+
+    # Record receive metric
+    metrics = target_slot.setdefault("metrics", _empty_metrics())
+    short_name = schema_key.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+    _record_receive(
+        metrics,
+        message=short_name,
+        enactment=inbound_eid or "",
+        ts=time.time(),
+        payload_size=len(json.dumps(inbound_payload)) if inbound_payload else 0,
+    )
+
     background_tasks.add_task(StateManager.save)
     return {"status": "ok"}
 
@@ -561,8 +731,8 @@ async def get_actions(
             for p_name, param_obj in proto.public_parameters.items():
                 if getattr(param_obj, "key", None) == "key":
                     protocol_keys.add(p_name.strip())
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"get_actions: could not load protocol '{slot['config']['protocol_name']}': {e}")
 
     # ── 1. Sync bindings from history ──────────────────────────────
     for m in list(adapter.history.messages()):
@@ -695,8 +865,8 @@ async def send_message(
     proto = None
     try:
         proto, _ = load_protocol(slot["config"]["protocol_name"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"send_message: could not load protocol '{slot['config']['protocol_name']}': {e}")
 
     # Auto-inject key parameters (use enactment_id as value if not supplied)
     for ref in safe_list(getattr(schema, "outs", [])):
@@ -737,6 +907,7 @@ async def send_message(
         new_msgs   = [m for m in to_send if not adapter.history.context(m).find(m.schema)]
         retry_msgs = [m for m in to_send if     adapter.history.context(m).find(m.schema)]
 
+        send_start = time.time()
         if new_msgs:
             await adapter.send(*new_msgs)
             record["bindings"].update(filtered)
@@ -744,9 +915,23 @@ async def send_message(
 
         for m in retry_msgs:
             await adapter.emitter.send(m)
+        send_end = time.time()
+
+        # Record send metric
+        metrics = slot.setdefault("metrics", _empty_metrics())
+        _record_send(
+            metrics,
+            message=message_name,
+            enactment=enactment_id,
+            ts=send_end,
+            duration_ms=round((send_end - send_start) * 1000, 3),
+            payload_size=len(json.dumps(filtered)),
+            recipients=len(to_send),
+        )
 
         return {"status": "sent", "payload": filtered}
     except Exception as e:
+        slot.setdefault("metrics", _empty_metrics())["send_failures"] += 1
         raise HTTPException(400, f"Send failed: {e}")
 
 
@@ -793,6 +978,40 @@ def get_knowledge_base(agent_id: str):
         }
 
     return {"agent_id": AGENT_ID, "knowledge_base": result}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Metrics — for benchmark/comparison with the centralized baseline
+# ─────────────────────────────────────────────────────────────────
+@app.get("/{agent_id}/metrics")
+def get_metrics(agent_id: str):
+    if agent_id != AGENT_ID:
+        raise HTTPException(404, "Unknown agent")
+
+    out: Dict[str, dict] = {}
+    for mas_id, slot in active_agents.items():
+        m = slot.get("metrics") or _empty_metrics()
+        sent_count = m["messages_sent"]
+        per_enact = {
+            eid: {
+                **e,
+                "duration_ms": round((e["last_ts"] - e["first_ts"]) * 1000, 3),
+            }
+            for eid, e in m["per_enact"].items()
+        }
+        out[mas_id] = {
+            "protocol":          slot["config"]["protocol_name"],
+            "role":              slot["config"]["role"],
+            "joined_at":         m.get("joined_at"),
+            "messages_sent":     sent_count,
+            "messages_received": m["messages_received"],
+            "send_failures":     m["send_failures"],
+            "avg_send_ms":       round(m["send_dur_sum_ms"] / sent_count, 3) if sent_count else 0,
+            "max_send_ms":       round(m["send_dur_max_ms"], 3),
+            "enactments":        per_enact,
+        }
+
+    return {"agent_id": AGENT_ID, "metrics": out}
 
 
 # ─────────────────────────────────────────────────────────────────
