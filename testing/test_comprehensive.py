@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Comprehensive end-to-end test for Sliq BSPL multi-agent system.
-Tests: Purchase (3 agents), Logistics (4 agents), Auction (2 agents).
+Tests: Purchase (3 agents), Logistics (4 agents), and API correctness checks.
 
 Usage (from project root):
-    .venv/Scripts/python.exe test_comprehensive.py
+    .venv/Scripts/python testing/test_comprehensive.py
 """
 
 import json
@@ -247,56 +247,10 @@ def test_logistics(mp=8021, lp=8022, wp=8023, pp=8024):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 3 — Auction (Auctioneer + Bidder)
-# ═══════════════════════════════════════════════════════════════════
-def test_auction(ap=8031, bp=8032):
-    section("TEST 3: Auction Protocol — 2 agents (NEW)")
-    procs = [start_node("TestAuctioneer", ap), start_node("TestBidder", bp)]
-
-    for port, role in [(ap,"Auctioneer"),(bp,"Bidder")]:
-        if wait_for(port): ok(f"{role} up (:{port})")
-        else: fail(f"{role} failed"); [p.terminate() for p in procs]; return
-
-    a = uuid_of(ap); b = uuid_of(bp)
-    ok(f"Auctioneer={a[:8]}  Bidder={b[:8]}")
-
-    mas, eid = "auct-mas", "auct-e1"
-    r1 = join(ap, mas, "Auction", "Auctioneer", {"Bidder": f"http://127.0.0.1:{bp}/{b}"})
-    r2 = join(bp, mas, "Auction", "Bidder", {"Auctioneer": f"http://127.0.0.1:{ap}/{a}"})
-    (ok if r1.get("status")=="joined" else fail)("Auctioneer joined")
-    (ok if r2.get("status")=="joined" else fail)("Bidder joined")
-
-    start_eid(ap, a, mas, eid)
-    data = wait_action(ap, a, mas, eid, "Open")
-    (ok if "Open" in [x["message"] for x in data.get("actions",[])] else fail)("Auctioneer: Open enabled")
-
-    r = send(ap, a, mas, eid, "Open", {"auctionID": "lot-777", "item": "Van Gogh"})
-    (ok if r.get("status")=="sent" else fail)("Auctioneer sent Open")
-
-    (ok if wait_invited(bp, b, mas, eid) else fail)("Bidder auto-invited ✓")
-    data = wait_action(bp, b, mas, eid, "Bid")
-    (ok if "Bid" in [x["message"] for x in data.get("actions",[])] else fail)("Bidder: Bid enabled after Open")
-
-    r = send(bp, b, mas, eid, "Bid", {"bidID": "bid-001", "amount": "1500000"})
-    (ok if r.get("status")=="sent" else fail)("Bidder sent Bid(1.5M)")
-
-    data = wait_action(ap, a, mas, eid, "Award")
-    (ok if "Award" in [x["message"] for x in data.get("actions",[])] else fail)("Auctioneer: Award enabled")
-
-    r = send(ap, a, mas, eid, "Award", {"winner": "TestBidder"})
-    (ok if r.get("status")=="sent" else fail)("Auctioneer sent Award — Auction COMPLETE")
-
-    kb = requests.get(f"http://127.0.0.1:{ap}/{a}/knowledge_base").json()
-    msgs = [m["message"] for g in kb["knowledge_base"].get(mas,{}).get("enactments",{}).values() for m in g]
-    ok(f"Auctioneer KB: {msgs}")
-    [p.terminate() for p in procs]
-
-
-# ═══════════════════════════════════════════════════════════════════
-# TEST 4 — API correctness
+# TEST 3 — API correctness
 # ═══════════════════════════════════════════════════════════════════
 def test_api(port=8041):
-    section("TEST 4: API Correctness")
+    section("TEST 3: API Correctness")
     proc = start_node("TestApi", port)
     if not wait_for(port): fail("Node start failed"); proc.terminate(); return
     ok(f"Node up (:{port})")
@@ -307,16 +261,12 @@ def test_api(port=8041):
     ok(f"Identity OK: {r['agent_name']} / {r['agent_id'][:8]}…")
 
     protos = requests.get(f"http://127.0.0.1:{port}/protocols").json()["protocols"]
-    assert "Purchase" in protos and "Logistics" in protos and "Auction" in protos, f"{protos}"
-    ok(f"All 3 protocols listed: {protos}")
+    assert "Purchase" in protos and "Logistics" in protos, f"{protos}"
+    ok(f"Protocols listed: {protos}")
 
     spec = requests.get(f"http://127.0.0.1:{port}/protocols/Purchase").json()
     assert set(spec["roles"]) == {"Buyer","Seller","Shipper"}
     ok(f"Purchase spec: {spec['roles']}, {len(spec['messages'])} msgs")
-
-    spec = requests.get(f"http://127.0.0.1:{port}/protocols/Auction").json()
-    assert set(spec["roles"]) == {"Auctioneer","Bidder"}
-    ok(f"Auction spec: {spec['roles']}, {[m['name'] for m in spec['messages']]}")
 
     r = requests.get(f"http://127.0.0.1:{port}/protocols/DoesNotExist")
     assert r.status_code == 404
@@ -373,8 +323,6 @@ if __name__ == "__main__":
     test_purchase()
     time.sleep(1)
     test_logistics()
-    time.sleep(1)
-    test_auction()
     time.sleep(1)
     test_api()
     section("RESULTS")

@@ -63,7 +63,7 @@ protocols/
 storage/
     agent_registry.json # Runtime agent name-to-port registry
 testing/
-    test_comprehensive.py     # End-to-end test suite (Purchase, Logistics, Auction)
+    test_comprehensive.py     # End-to-end test suite (Purchase, Logistics)
     benchmark.py              # Decentralised vs centralised benchmark
     benchmark_results.csv     # Results from 10-iteration benchmark run
     test_gateway.py           # Gateway routing tests
@@ -100,8 +100,8 @@ python agent_api.py
 python testing/test_comprehensive.py
 ```
 
-Runs four test groups: Purchase (3 agents), Logistics (4 agents), Auction
-(2 agents), and API correctness checks.
+Runs three test groups: Purchase (3 agents), Logistics (4 agents), and API
+correctness checks.
 
 ## Running the Benchmark
 
@@ -109,7 +109,7 @@ Runs four test groups: Purchase (3 agents), Logistics (4 agents), Auction
 python testing/benchmark.py
 ```
 
-Runs 10 iterations of the Purchase protocol on both the decentralised and
+Runs 30 iterations of the Purchase protocol on both the decentralised and
 centralised systems and outputs a comparison table.
 
 ## License
